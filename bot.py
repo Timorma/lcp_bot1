@@ -1,6 +1,7 @@
 import os
 import logging
 import io
+import traceback
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from fetcher import fetch_market_data
@@ -26,24 +27,32 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ جاري تحليل {symbol} وحساب السيولة والمستويات...")
     try:
         data = fetch_market_data(symbol)
-        if not data:
+        if data is None or data.empty:
             await update.message.reply_text(f"❌ لم يتم العثور على بيانات لـ {symbol}")
             return
         
         analysis = analyze_confluence(data)
         chart_buf = generate_chart(data, analysis)
         
+        if not chart_buf:
+            await update.message.reply_text("❌ حدث خطأ أثناء رسم الشارت.")
+            return
+
+        if hasattr(chart_buf, 'seek'):
+            chart_buf.seek(0)
+        
         caption = (
             f"📊 **تحليل {symbol} - ICB Framework**\n\n"
             f"🔹 الاتجاه: {analysis.get('bias', 'N/A')}\n"
             f"🎯 منطقة الدخول: {analysis.get('entry', 'N/A')}\n"
             f"🛑 وقف الخسارة: {analysis.get('sl', 'N/A')}\n"
-            f"🎯 الأهداف: {analysis.get('tp', 'N/A')}\n"
+            f"🎯 الأهداف: {analysis.get('tp', 'N/A')}"
         )
         await update.message.reply_photo(photo=chart_buf, caption=caption, parse_mode='Markdown')
     except Exception as e:
-        logging.error(f"Error handling analysis: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء إجراء التحليل. حاول مرة أخرى لاحقاً.")
+        err_details = traceback.format_exc()
+        logging.error(f"Detailed Error handling analysis: {err_details}")
+        await update.message.reply_text(f"❌ خطأ تقني: {str(e)}")
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
