@@ -1,4 +1,5 @@
 import yfinance as yf
+import pandas as pd
 
 def fetch_market_data(symbol: str):
     symbol = symbol.strip().upper()
@@ -14,12 +15,13 @@ def fetch_market_data(symbol: str):
     try:
         ticker = yf.Ticker(target_symbol)
         df = ticker.history(period="5d", interval="1d")
-        if df.empty:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period="5d", interval="1d")
-        if df.empty:
+        
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             return None
+            
         return df
     except Exception:
         return None
-
