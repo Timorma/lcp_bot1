@@ -27,14 +27,24 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ جاري تحليل {symbol} وحساب السيولة والمستويات...")
     try:
         data = fetch_market_data(symbol)
-        if data is None or data.empty:
+        
+        # التأكد الآمن من وجود البيانات بدون الوقوع في خطأ الـ DataFrame Ambiguity
+        if data is None:
             await update.message.reply_text(f"❌ لم يتم العثور على بيانات لـ {symbol}")
+            return
+            
+        try:
+            if data.empty:
+                await update.message.reply_text(f"❌ بيانات {symbol} فارغة.")
+                return
+        except Exception:
+            await update.message.reply_text(f"❌ تعذر قراءة بيانات {symbol}.")
             return
         
         analysis = analyze_confluence(data)
         chart_buf = generate_chart(data, analysis)
         
-        if not chart_buf:
+        if chart_buf is None:
             await update.message.reply_text("❌ حدث خطأ أثناء رسم الشارت.")
             return
 
@@ -51,8 +61,8 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=chart_buf, caption=caption, parse_mode='Markdown')
     except Exception as e:
         err_details = traceback.format_exc()
-        # طباعة الخطأ التقني بالتفصيل في الشات لنعرف السبب فوراً
-        await update.message.reply_text(f"⚠️ خطأ تقني مفصل:\n{err_details[-400:]}")
+        logging.error(f"Detailed Error: {err_details}")
+        await update.message.reply_text(f"⚠️ خطأ تقني:\n{str(e)[:200]}")
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
