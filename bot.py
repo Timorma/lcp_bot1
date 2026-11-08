@@ -51,8 +51,8 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=chart_buf, caption=caption, parse_mode='Markdown')
     except Exception as e:
         err_details = traceback.format_exc()
-        logging.error(f"Detailed Error handling analysis: {err_details}")
-        await update.message.reply_text(f"❌ خطأ تقني: {str(e)}")
+        # طباعة الخطأ التقني بالتفصيل في الشات لنعرف السبب فوراً
+        await update.message.reply_text(f"⚠️ خطأ تقني مفصل:\n{err_details[-400:]}")
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
