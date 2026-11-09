@@ -1,60 +1,147 @@
-import json
-import os
+import logging
 import pandas as pd
 import yfinance as yf
 
-def fetch_market_data(symbol: str):
-    sym = symbol.strip().upper()
-    
-    # قائمة الرموز البديلة والمباشرة للذهب والسلع لضمان جلب البيانات فوراً
-    symbols_to_try = [sym]
-    
-    if sym in ["XAUUSD", "GOLD", "GC", "GC=F"]:
-        symbols_to_try = ["GC=F", "GOLD", "IAU", "GLD"]
-    elif sym in ["XAGUSD", "SILVER", "SI", "SI=F"]:
-        symbols_to_try = ["SI=F", "SLV"]
-    elif sym in ["OIL", "WTI", "CL", "CL=F"]:
-        symbols_to_try = ["CL=F", "BZ=F"]
-    elif "/" in sym:
-        clean_sym = sym.replace("/", "") + "=X"
-        symbols_to_try = [clean_sym, sym.replace("/", "-")]
-    elif len(sym) == 6 and not sym.endswith("USDT") and not sym.endswith("USD"):
-        symbols_to_try = [sym + "=X", sym]
-    else:
-        if not sym.endswith("USDT") and not sym.startswith("^"):
-            symbols_to_try = [f"{sym}USDT", f"{sym}-USD", sym]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    df = None
-    for s in symbols_to_try:
-        try:
-            # محاولة سحب البيانات لكل رمز محتمل
-            df = yf.download(s, period="14d", interval="1h", progress=False)
-            if df is not None and not df.empty:
+ALIASES = {
+    "XAUUSD": ["GC=F"],
+    "GOLD": ["GC=F"],
+    "GC": ["GC=F"],
+    "XAGUSD": ["SI=F"],
+    "SILVER": ["SI=F"],
+    "SI": ["SI=F"],
+    "OIL": ["CL=F"],
+    "WTI": ["CL=F"],
+    "CL": ["CL=F"],
+}
+
+def resolve_symbols(symbol):
+    sym = str(symbol).strip().upper()
+
+    if not sym:
+        return []
+
+    if sym in ALIASES:
+        return ALIASES[sym]
+
+    if "/" in sym:
+        return [sym.replace("/", "") + "=X", sym.replace("/", "-")]
+
+    if len(sym) == 6 and sym.isalpha():
+        return [sym + "=X", sym]
+
+    if sym.endswith("USDT"):
+        base = sym[:-4]
+        return [base + "-USD", sym]
+
+    return [sym]
+
+
+def normalize_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        price_fields = {"Open", "High", "Low", "Close", "Volume"}
+        selected = None
+
+        for level in range(df.columns.nlevels):
+            values = set(df.columns.get_level_values(level))
+            if {"Open", "High", "Low", "Close"}.issubset(values):
+                selected = level
                 break
-        except Exception:
-            continue
 
+        if selected is None:
+            return None
+
+        df.columns = df.columns.get_level_values(selected)
+
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    return df
+
+
+def validate_data(df):
     if df is None or df.empty:
         return None
 
-    try:
-        if hasattr(df.columns, 'levels') or isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        if not all(col in df.columns for col in required_cols):
-            return None
+    required = ["Open", "High", "Low", "Close"]
 
-        # إعادة التجميع لفريم 144 دقيقة المؤسسي
-        df = df.resample('144min').agg({
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        }).dropna()
-        
-        return df if not df.empty else None
-    except Exception as e:
-        print(f"Error processing data for {symbol}: {e}")
+    if not all(col in df.columns for col in required):
         return None
+
+    df = df.copy()
+
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=required)
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+
+    valid_prices = (
+        (df["Open"] > 0) &
+        (df["High"] > 0) &
+        (df["Low"] > 0) &
+        (df["Close"] > 0) &
+        (df["High"] >= df["Low"]) &
+        (df["High"] >= df["Open"]) &
+        (df["High"] >= df["Close"]) &
+        (df["Low"] <= df["Open"]) &
+        (df["Low"] <= df["Close"])
+    )
+
+    df = df.loc[valid_prices]
+
+    if len(df) < 20:
+        return None
+
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def fetch_market_data(symbol, period="60d", interval="1h"):
+    candidates = resolve_symbols(symbol)
+
+    if not candidates:
+        logger.warning("Empty symbol received")
+        return None
+
+    for candidate in candidates:
+        try:
+            logger.info("Fetching %s", candidate)
+
+            df = yf.download(
+                candidate,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False
+            )
+
+            df = normalize_columns(df)
+
+            df = validate_data(df)
+
+            if df is not None and not df.empty:
+                df.attrs["requested_symbol"] = str(symbol).upper()
+                df.attrs["source_symbol"] = candidate
+                df.attrs["interval"] = interval
+                df.attrs["period"] = period
+
+                logger.info(
+                    "Loaded %s rows for %s from %s",
+                    len(df),
+                    symbol,
+                    candidate
+                )
+
+                return df
+
+        except Exception:
+            logger.exception("Failed fetching %s", candidate)
+
+    logger.warning("No valid data found for %s", symbol)
+    return None
