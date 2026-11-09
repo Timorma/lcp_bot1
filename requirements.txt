@@ -5,3 +5,4 @@ matplotlib
 numpy
 yfinance
 # أضف أي مكتبات تانية بتستخدمها في fetcher / analyzer / chart_drawer
+pypdf>=5.0.0
