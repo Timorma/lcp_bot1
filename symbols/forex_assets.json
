@@ -1,0 +1,32 @@
+{
+  "aliases": {
+    "GOLD": "GC=F",
+    "XAUUSD": "GC=F",
+    "GC": "GC=F",
+    "XAU": "GC=F",
+    
+    "SILVER": "SI=F",
+    "XAGUSD": "SI=F",
+    "SI": "SI=F",
+    "XAG": "SI=F",
+    
+    "OIL": "CL=F",
+    "CRUDE": "CL=F",
+    "WTI": "CL=F",
+    "CL": "CL=F",
+    "BRENT": "BZ=F",
+    "BZ": "BZ=F",
+    
+    "SPX": "^GSPC",
+    "SP500": "^GSPC",
+    "S&P500": "^GSPC",
+    "GSPC": "^GSPC",
+    
+    "NASDAQ": "^IXIC",
+    "NSQ": "^IXIC",
+    "IXIC": "^IXIC",
+    
+    "DOW": "^DJI",
+    "DJI": "^DJI"
+  }
+}
