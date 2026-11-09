@@ -3,50 +3,44 @@ import os
 import pandas as pd
 import yfinance as yf
 
-def load_aliases():
-    alias_path = "symbols/asset_aliases.json"
-    if os.path.exists(alias_path):
-        try:
-            with open(alias_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("aliases", {})
-        except Exception:
-            pass
-    return {}
-
 def fetch_market_data(symbol: str):
     sym = symbol.strip().upper()
     
-    # تحميل قاموس المرادفات
-    aliases = load_aliases()
-    if sym in aliases:
-        sym = aliases[sym]
+    # قائمة الرموز البديلة والمباشرة للذهب والسلع لضمان جلب البيانات فوراً
+    symbols_to_try = [sym]
+    
+    if sym in ["XAUUSD", "GOLD", "GC", "GC=F"]:
+        symbols_to_try = ["GC=F", "GOLD", "IAU", "GLD"]
+    elif sym in ["XAGUSD", "SILVER", "SI", "SI=F"]:
+        symbols_to_try = ["SI=F", "SLV"]
+    elif sym in ["OIL", "WTI", "CL", "CL=F"]:
+        symbols_to_try = ["CL=F", "BZ=F"]
     elif "/" in sym:
-        sym = sym.replace("/", "") + "=X"
-    elif len(sym) == 6 and not sym.endswith("USDT") and not sym.endswith("USD") and not sym.endswith("=X") and not sym.endswith("=F"):
-        sym = sym + "=X"
-    elif not sym.endswith("USDT") and not sym.endswith("USD") and not sym.startswith("^") and not sym.endswith("=F") and not sym.endswith("=X"):
-        sym = f"{sym}USDT"
+        clean_sym = sym.replace("/", "") + "=X"
+        symbols_to_try = [clean_sym, sym.replace("/", "-")]
+    elif len(sym) == 6 and not sym.endswith("USDT") and not sym.endswith("USD"):
+        symbols_to_try = [sym + "=X", sym]
+    else:
+        if not sym.endswith("USDT") and not sym.startswith("^"):
+            symbols_to_try = [f"{sym}USDT", f"{sym}-USD", sym]
 
     df = None
-    try:
-        # محاولة أولى بسحب البيانات لفترة أطول قليلاً
-        df = yf.download(sym, period="30d", interval="1h", progress=False)
-        
-        # لو فشلت وفوركس، جرب نضيف "=X"
-        if (df is None or df.empty) and not sym.endswith("=X") and len(sym) == 6:
-            df = yf.download(sym + "=X", period="30d", interval="1h", progress=False)
-            
-        # لو فشلت وكانت عملة رقمية، جرب -USD بدلاً من USDT
-        if (df is None or df.empty) and "USDT" in sym:
-            df = yf.download(sym.replace("USDT", "-USD"), period="30d", interval="1h", progress=False)
+    for s in symbols_to_try:
+        try:
+            # محاولة سحب البيانات لكل رمز محتمل
+            df = yf.download(s, period="14d", interval="1h", progress=False)
+            if df is not None and not df.empty:
+                break
+        except Exception:
+            continue
 
-        if df is None or df.empty:
-            return None
-            
+    if df is None or df.empty:
+        return None
+
+    try:
         if hasattr(df.columns, 'levels') or isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
-        # التأكد من وجود أعمدة الأسعار الأساسية
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         if not all(col in df.columns for col in required_cols):
             return None
@@ -60,7 +54,7 @@ def fetch_market_data(symbol: str):
             'Volume': 'sum'
         }).dropna()
         
-        return df
+        return df if not df.empty else None
     except Exception as e:
-        print(f"Error fetching {sym}: {e}")
+        print(f"Error processing data for {symbol}: {e}")
         return None
