@@ -72,8 +72,12 @@ def consult_ai_brain(user_query: str) -> str:
         "أجب باحترافية، وكن محللاً ذكياً يفكر خارج الصندوق."
     )
     
-    # قائمة موديلات Groq المعتمدة للتجربة بالترتيب لضمان التوافق 100%
-    available_models = ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]
+    # قائمة موديلات Groq الحالية (نوفمبر 2026)
+    available_models = [
+        "openai/gpt-oss-20b",      # الأسرع والأرخص
+        "openai/gpt-oss-120b",     # الأقوى
+        "qwen/qwen3.8-27b"         # خيار احتياطي قوي
+    ]
     
     for model_name in available_models:
         try:
@@ -189,7 +193,7 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_message))
     print("Cyber-Bot with Groq AI is running...")
     app.run_polling()
 
