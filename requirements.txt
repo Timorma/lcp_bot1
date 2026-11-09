@@ -1,8 +1,5 @@
-pyTelegramBotAPI
+openai
 python-telegram-bot
 yfinance
 pandas
 matplotlib
-pypdf
-google-genai
-google-generativeai
