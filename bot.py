@@ -195,8 +195,8 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     
-    # تم فصل الفلتر لتجنب أي مشاكل في الـ Syntax
-    text_filter = filters.TEXT & (\~filters.COMMAND)
+    # حل آمن 100% بدون استخدام علامة \~
+    text_filter = filters.TEXT & filters.COMMAND.__invert__()
     app.add_handler(MessageHandler(text_filter, handle_message))
     
     print("Cyber-Bot with Groq AI is running...")
