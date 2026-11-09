@@ -72,7 +72,7 @@ def consult_ai_brain(user_query: str) -> str:
     
     try:
         response = ai_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
