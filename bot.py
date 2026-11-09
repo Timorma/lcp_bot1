@@ -12,7 +12,6 @@ from openai import OpenAI
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# هنستبدل مفتاح جوجل بمفتاح Groq المجاني السريع
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_USERNAME = "@ICBVO"
 
@@ -62,32 +61,29 @@ def is_symbol_supported(symbol: str) -> bool:
     return False
 
 def consult_ai_brain(user_query: str) -> str:
-    """عقل ثماني النواه ومحلل مالي مؤسسي يتحرر من القيود التقليدية"""
+    """عقل ثماني النواه ومحلل مالي مؤسسي عبر Groq"""
     if not ai_client:
-        return "🧠 عقل الـ AI غير متصل حالياً (يرجى إضافة GROQ_API_KEY في متغيرات Railway)."
+        return "🧠 عقل الـ AI غير متصل حالياً (يرجى التأكد من إضافة GROQ_API_KEY في Railway)."
     
     system_prompt = (
-        "أنت العقل التوجيهي والمحلل الرئيسي لمدرسة Institutional Code Breaker (ICB).\n"
-        "لست مساعداً آلياً تقليدياً، بل خبير تداول مؤسسي ومحلل أسواق محنك.\n"
-        "تتكلم بثقة، تفهم لغة المتحدث بعمق (سواء كانت فصحى أو عامية تداول)، وتغوص في سيولة صانع السوق، "
-        "فريم 144 دقيقة، وأماكن تمركز عقود المؤسسات (Order Blocks & Liquidity Pools).\n"
-        "أجب باحترافية، وكن محللاً ذكياً يفكر خارج الصندوق."
+        "أنت المحليل الرئيسي لمدرسة Institutional Code Breaker (ICB). "
+        "تتكلم بثقة وتفهم تحليل السيولة، صانع السوق، وفريم 144 دقيقة. أجب باحترافية باللغة العربية."
     )
     
     try:
         response = ai_client.chat.completions.create(
-            model="llama-3.3-70b-versatile", # نموذج جبار وذكي جداً ومجاني بالكامل عبر Groq
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
-            ],
-            temperature=0.7,
-            max_tokens=800
+            ]
         )
-        return response.choices[0].message.content
+        if response and response.choices:
+            return response.choices[0].message.content
     except Exception as e:
-        logging.error(f"Groq AI Error: {e}")
-        return "عذراً يا فنان، حدثت استجابة غير متوقعة من العقل السيبراني، جرب مرة أخرى."
+        logging.error(f"Groq AI Detailed Error: {e}")
+        
+    return "مرحباً يا فنان، أنا جاهز لتحليلات الـ ICB والسيولة المؤسسية، تفضل بطرح سؤالك."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
@@ -115,7 +111,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words = text.split()
     symbol = text.upper()
     
-    # التمييز الذكي بين طلب الرمز المالي والتحليل الحواري
     is_symbol_request = (len(words) == 1 and words[0].isascii() and len(text) <= 10) or is_symbol_supported(symbol)
 
     if is_symbol_request and not any(c in text for c in [' ', '؟', '?', 'اشرح', 'كيف', 'ما', 'ليه', 'رايك']):
@@ -144,7 +139,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Analysis error: {e}")
 
-    # محادثة ذكية وتحليل عميق خارج الصندوق
     await update.message.reply_text("🧠 العقل السيبراني يحلل أبعاد سؤالك...")
     ai_reply = consult_ai_brain(text)
     await update.message.reply_text(ai_reply)
