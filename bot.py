@@ -68,15 +68,22 @@ def consult_ai_brain(user_query: str) -> str:
         "أجب عن أسئلة المستخدم بأسلوب دقيق، احترافي، وواضح باللغة العربية."
     )
     
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=f"{system_prompt}\n\nطلب المستخدم: {user_query}"
-        )
-        return response.text
-    except Exception as e:
-        logging.error(f"AI Generation Error: {e}")
-        return "عذراً، حدث خطأ أثناء معالجة طلب الذكاء الاصطناعي."
+    # تجربة الموديلات المتاحة تلقائياً لتجنب أي خطأ
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash"]
+    
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=f"{system_prompt}\n\nطلب المستخدم: {user_query}"
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            logging.error(f"AI Error with model {model_name}: {e}")
+            continue
+            
+    return "عذراً، حدث خطأ في معالجة طلب الذكاء الاصطناعي. يجدر التأكد من صحة وصلاحية مفتاح الـ API."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
