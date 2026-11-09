@@ -1,63 +1,64 @@
-import logging
-import pandas as pd
-import yfinance as yf
 
-logging.basicConfig(level=logging.INFO)
+import os
+import logging
+import requests
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
-ALIASES = {
-    "XAUUSD": ["GC=F"],
-    "GOLD": ["GC=F"],
-    "GC": ["GC=F"],
-    "XAGUSD": ["SI=F"],
-    "SILVER": ["SI=F"],
-    "SI": ["SI=F"],
-    "OIL": ["CL=F"],
-    "WTI": ["CL=F"],
-    "CL": ["CL=F"],
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
+
+TD_INTERVALS = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "45m": "45min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "8h": "8h",
+    "1d": "1day",
+    "1w": "1week",
+    "1mo": "1month"
 }
 
-def resolve_symbols(symbol):
-    sym = str(symbol).strip().upper()
-
-    if not sym:
-        return []
-
-    if sym in ALIASES:
-        return ALIASES[sym]
-
-    if "/" in sym:
-        return [sym.replace("/", "") + "=X", sym.replace("/", "-")]
-
-    if len(sym) == 6 and sym.isalpha():
-        return [sym + "=X", sym]
-
-    if sym.endswith("USDT"):
-        base = sym[:-4]
-        return [base + "-USD", sym]
-
-    return [sym]
+BINANCE_INTERVALS = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "6h": "6h",
+    "8h": "8h",
+    "12h": "12h",
+    "1d": "1d",
+    "3d": "3d",
+    "1w": "1w",
+    "1mo": "1M"
+}
 
 
-def normalize_columns(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        price_fields = {"Open", "High", "Low", "Close", "Volume"}
-        selected = None
+def normalize_symbol(symbol):
+    sym = str(symbol).strip().upper().replace(" ", "")
 
-        for level in range(df.columns.nlevels):
-            values = set(df.columns.get_level_values(level))
-            if {"Open", "High", "Low", "Close"}.issubset(values):
-                selected = level
-                break
+    aliases = {
+        "GOLD": "XAU/USD",
+        "XAUUSD": "XAU/USD",
+        "SILVER": "XAG/USD",
+        "XAGUSD": "XAG/USD",
+        "EURUSD": "EUR/USD",
+        "GBPUSD": "GBP/USD",
+        "USDJPY": "USD/JPY",
+        "AUDUSD": "AUD/USD",
+        "USDCAD": "USD/CAD",
+        "NZDUSD": "NZD/USD"
+    }
 
-        if selected is None:
-            return None
-
-        df.columns = df.columns.get_level_values(selected)
-
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    return df
+    return aliases.get(sym, sym)
 
 
 def validate_data(df):
@@ -81,11 +82,8 @@ def validate_data(df):
     df = df[~df.index.duplicated(keep="last")]
     df = df.sort_index()
 
-    valid_prices = (
+    valid = (
         (df["Open"] > 0) &
-        (df["High"] > 0) &
-        (df["Low"] > 0) &
-        (df["Close"] > 0) &
         (df["High"] >= df["Low"]) &
         (df["High"] >= df["Open"]) &
         (df["High"] >= df["Close"]) &
@@ -93,7 +91,7 @@ def validate_data(df):
         (df["Low"] <= df["Close"])
     )
 
-    df = df.loc[valid_prices]
+    df = df.loc[valid]
 
     if len(df) < 20:
         return None
@@ -101,47 +99,207 @@ def validate_data(df):
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
-def fetch_market_data(symbol, period="60d", interval="1h"):
-    candidates = resolve_symbols(symbol)
+def fetch_binance(symbol, interval, limit):
+    sym = str(symbol).strip().upper().replace("/", "")
 
-    if not candidates:
+    if sym.endswith("USD") and not sym.endswith("USDT"):
+        sym = sym[:-3] + "USDT"
+
+    if not sym.endswith("USDT") and not sym.endswith("BTC") and not sym.endswith("ETH") and not sym.endswith("BNB"):
+        return None
+
+    if interval not in BINANCE_INTERVALS:
+        return None
+
+    params = {
+        "symbol": sym,
+        "interval": BINANCE_INTERVALS[interval],
+        "limit": min(max(int(limit), 20), 1000)
+    }
+
+    try:
+        response = requests.get(
+            BINANCE_URL,
+            params=params,
+            timeout=15
+        )
+
+        response.raise_for_status()
+        rows = response.json()
+
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        columns = [
+            "Time",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "CloseTime",
+            "QuoteVolume",
+            "Trades",
+            "TakerBuyVolume",
+            "TakerBuyQuoteVolume",
+            "Ignore"
+        ]
+
+        raw = pd.DataFrame(rows, columns=columns)
+
+        raw["Time"] = pd.to_datetime(
+            raw["Time"],
+            unit="ms",
+            utc=True
+        )
+
+        raw = raw.set_index("Time")
+
+        result = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+        result = validate_data(result)
+
+        if result is not None:
+            result.attrs["source"] = "Binance Public API"
+            result.attrs["source_symbol"] = sym
+            result.attrs["interval"] = interval
+
+        return result
+
+    except Exception:
+        logger.exception("Binance data request failed")
+        return None
+
+
+def fetch_twelve_data(symbol, interval, limit):
+    api_key = os.getenv("TWELVE_DATA_API_KEY")
+
+    if not api_key:
+        logger.warning("TWELVE_DATA_API_KEY is missing")
+        return None
+
+    if interval not in TD_INTERVALS:
+        logger.warning("Unsupported Twelve Data interval: %s", interval)
+        return None
+
+    sym = normalize_symbol(symbol)
+
+    params = {
+        "symbol": sym,
+        "interval": TD_INTERVALS[interval],
+        "outputsize": min(max(int(limit), 20), 5000),
+        "timezone": "UTC",
+        "order": "ASC",
+        "apikey": api_key
+    }
+
+    try:
+        response = requests.get(
+            TWELVE_DATA_URL,
+            params=params,
+            timeout=20
+        )
+
+        response.raise_for_status()
+        payload = response.json()
+
+        if payload.get("status") == "error":
+            logger.warning(
+                "Twelve Data error: %s",
+                payload.get("message", "Unknown error")
+            )
+            return None
+
+        values = payload.get("values")
+
+        if not values:
+            logger.warning("No Twelve Data values for %s", sym)
+            return None
+
+        df = pd.DataFrame(values)
+
+        required = ["datetime", "open", "high", "low", "close"]
+
+        if not all(col in df.columns for col in required):
+            return None
+
+        df["datetime"] = pd.to_datetime(
+            df["datetime"],
+            utc=True,
+            errors="coerce"
+        )
+
+        df = df.rename(columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume"
+        })
+
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
+
+        df = df.set_index("datetime")
+
+        df = validate_data(df)
+
+        if df is not None:
+            df.attrs["source"] = "Twelve Data"
+            df.attrs["source_symbol"] = sym
+            df.attrs["interval"] = interval
+
+        return df
+
+    except Exception:
+        logger.exception("Twelve Data request failed")
+        return None
+
+
+def fetch_market_data(symbol, period=None, interval="1h", limit=500):
+    sym = str(symbol).strip().upper()
+
+    if not sym:
         logger.warning("Empty symbol received")
         return None
 
-    for candidate in candidates:
-        try:
-            logger.info("Fetching %s", candidate)
+    if interval not in TD_INTERVALS:
+        logger.warning("Unsupported interval: %s", interval)
+        return None
 
-            df = yf.download(
-                candidate,
-                period=period,
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=False
+    logger.info(
+        "Fetching %s | interval=%s | limit=%s",
+        sym,
+        interval,
+        limit
+    )
+
+    crypto_candidate = (
+        sym.endswith("USDT") or
+        sym.endswith("USD") or
+        "/" in sym
+    )
+
+    if crypto_candidate:
+        binance_data = fetch_binance(sym, interval, limit)
+
+        if binance_data is not None:
+            binance_data.attrs["requested_symbol"] = sym
+            logger.info(
+                "Loaded %s rows from Binance",
+                len(binance_data)
             )
+            return binance_data
 
-            df = normalize_columns(df)
+    td_data = fetch_twelve_data(sym, interval, limit)
 
-            df = validate_data(df)
+    if td_data is not None:
+        td_data.attrs["requested_symbol"] = sym
+        logger.info(
+            "Loaded %s rows from Twelve Data",
+            len(td_data)
+        )
+        return td_data
 
-            if df is not None and not df.empty:
-                df.attrs["requested_symbol"] = str(symbol).upper()
-                df.attrs["source_symbol"] = candidate
-                df.attrs["interval"] = interval
-                df.attrs["period"] = period
-
-                logger.info(
-                    "Loaded %s rows for %s from %s",
-                    len(df),
-                    symbol,
-                    candidate
-                )
-
-                return df
-
-        except Exception:
-            logger.exception("Failed fetching %s", candidate)
-
-    logger.warning("No valid data found for %s", symbol)
+    logger.error("All market data sources failed for %s", sym)
     return None
