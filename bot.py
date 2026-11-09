@@ -16,11 +16,18 @@ CHANNEL_USERNAME = "@ICBVO"
 async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        # طباعة حالة المستخدم في الـ Logs للمتابعة الدقيقة
+        logging.info(f"User {user_id} subscription status: {member.status}")
+        
+        # السماح فقط لو كان عضواً فعلياً أو مشرفاً أو منشئاً للقناة
         if member.status in ['member', 'administrator', 'creator']:
             return True
+        
+        # أي حالة تانية (left, kicked, restricted) ترفض فورا
         return False
     except Exception as e:
-        logging.error(f"Error checking subscription: {e}")
+        # لو حصل أي خطأ في الفحص (مثلا البوت ليس مشرفاً كفاية بالقناة)، نعتبره غير مشترك حرصا على الأمان
+        logging.error(f"Error checking subscription for {user_id}: {e}")
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -38,7 +45,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # التحقق من الاشتراك الإجباري أولاً
+    # التحقق الحاسم من الاشتراك الإجباري أولاً
     is_subscribed = await check_subscription(user_id, context)
     if not is_subscribed:
         await update.message.reply_text(
