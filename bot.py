@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from fetcher import fetch_market_data
 from analyzer import analyze_confluence
 from chart_drawer import generate_chart
-from google import genai
+import google.generativeai as genai
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -15,10 +15,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHANNEL_USERNAME = "@ICBVO"
 
-# إعداد محرك الذكاء الاصطناعي
-ai_client = None
+# إعداد مكتبة جوجل بالطريقة الكلاسيكية المستقرة
 if GEMINI_API_KEY:
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
 
 async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -58,8 +57,8 @@ def is_symbol_supported(symbol: str) -> bool:
     return False
 
 def consult_ai_brain(user_query: str) -> str:
-    """استشارة نموذج جوجل للذكاء الاصطناعي للإجابة على الأسئلة أو تحليل السوق"""
-    if not ai_client:
+    """استشارة نموذج جوجل للإجابة على الأسئلة أو تحليل السوق"""
+    if not GEMINI_API_KEY:
         return "🧠 نموذج الذكاء الاصطناعي غير متصل (يرجى التأكد من إضافة GEMINI_API_KEY في Railway)."
     
     system_prompt = (
@@ -68,22 +67,19 @@ def consult_ai_brain(user_query: str) -> str:
         "أجب عن أسئلة المستخدم بأسلوب دقيق، احترافي، وواضح باللغة العربية."
     )
     
-    # تجربة الموديلات المتاحة تلقائياً لتجنب أي خطأ
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash"]
+    models_to_try = ["gemini-1.5-flash", "gemini-pro"]
     
     for model_name in models_to_try:
         try:
-            response = ai_client.models.generate_content(
-                model=model_name,
-                contents=f"{system_prompt}\n\nطلب المستخدم: {user_query}"
-            )
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(f"{system_prompt}\n\nطلب المستخدم: {user_query}")
             if response and response.text:
                 return response.text
         except Exception as e:
             logging.error(f"AI Error with model {model_name}: {e}")
             continue
             
-    return "عذراً، حدث خطأ في معالجة طلب الذكاء الاصطناعي. يجدر التأكد من صحة وصلاحية مفتاح الـ API."
+    return "عذراً، حدث خطأ في معالجة طلب الذكاء الاصطناعي. تأكد من صحة المفتاح."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
