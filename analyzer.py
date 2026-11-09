@@ -1,291 +1,530 @@
-
 import logging
 import numpy as np
 import pandas as pd
+from fetcher import TIMEFRAMES
 
 logger = logging.getLogger(__name__)
 
+TIMEFRAME_WEIGHTS = {
+    "1m": 0.5,
+    "3m": 0.6,
+    "5m": 0.7,
+    "15m": 0.8,
+    "30m": 0.9,
+    "45m": 1.0,
+    "1h": 1.1,
+    "2h": 1.2,
+    "4h": 1.4,
+    "6h": 1.5,
+    "8h": 1.6,
+    "12h": 1.7,
+    "1d": 2.0,
+    "3d": 2.3,
+    "1w": 2.7,
+    "1mo": 3.0,
+    "45d": 3.2,
+    "90d": 3.5,
+    "144d": 4.0
+}
 
-def analyze_confluence(df):
-    neutral = {
-        "bias": "Neutral ⚪",
-        "entry": 0.0,
-        "sl": 0.0,
-        "tp": 0.0,
-        "confidence": 0,
-        "volatility": 0.0,
-        "structure": "Insufficient data",
+
+def _empty_result():
+    return {
+        "bias": "غير محدد",
+        "confidence": 0.0,
+        "last_close": None,
+        "atr": None,
+        "volatility_pct": None,
+        "structure": "بيانات غير كافية",
+        "support": [],
+        "resistance": [],
         "evidence": [],
-        "warnings": ["Insufficient or invalid market data"]
+        "warnings": ["لا توجد بيانات كافية"]
     }
 
-    try:
-        if df is None or len(df) < 30:
-            return neutral.copy()
 
-        required = ["Open", "High", "Low", "Close"]
+def _prepare(df):
+    if df is None or len(df) < 30:
+        return None
 
-        if not all(col in df.columns for col in required):
-            return neutral.copy()
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close"
+    ]
 
-        data = df.copy()
+    if not all(c in df.columns for c in required):
+        return None
 
-        for col in required:
-            data[col] = pd.to_numeric(
-                data[col],
-                errors="coerce"
-            )
+    data = df.copy()
 
-        data = data.dropna(subset=required)
-
-        if len(data) < 30:
-            return neutral.copy()
-
-        data = data.sort_index()
-
-        open_price = data["Open"]
-        high = data["High"]
-        low = data["Low"]
-        close = data["Close"]
-
-        last_close = float(close.iloc[-1])
-
-        if not np.isfinite(last_close) or last_close <= 0:
-            return neutral.copy()
-
-        previous_close = close.shift(1)
-
-        true_range = pd.concat(
-            [
-                high - low,
-                (high - previous_close).abs(),
-                (low - previous_close).abs()
-            ],
-            axis=1
-        ).max(axis=1)
-
-        atr_series = true_range.rolling(14).mean()
-        atr = float(atr_series.iloc[-1])
-
-        if not np.isfinite(atr) or atr <= 0:
-            return neutral.copy()
-
-        volatility_pct = (atr / last_close) * 100
-
-        ema_fast = close.ewm(
-            span=20,
-            adjust=False
-        ).mean()
-
-        ema_slow = close.ewm(
-            span=50,
-            adjust=False
-        ).mean()
-
-        fast_value = float(ema_fast.iloc[-1])
-        slow_value = float(ema_slow.iloc[-1])
-
-        trend_up = fast_value > slow_value
-        trend_down = fast_value < slow_value
-
-        recent_high = float(high.iloc[-21:-1].max())
-        recent_low = float(low.iloc[-21:-1].min())
-
-        previous_high = float(high.iloc[-2])
-        previous_low = float(low.iloc[-2])
-
-        candle_open = float(open_price.iloc[-1])
-        candle_high = float(high.iloc[-1])
-        candle_low = float(low.iloc[-1])
-
-        candle_range = candle_high - candle_low
-
-        if candle_range > 0:
-            upper_wick = candle_high - max(
-                candle_open,
-                last_close
-            )
-
-            lower_wick = min(
-                candle_open,
-                last_close
-            ) - candle_low
-
-            upper_wick_ratio = upper_wick / candle_range
-            lower_wick_ratio = lower_wick / candle_range
-            body_ratio = abs(last_close - candle_open) / candle_range
-        else:
-            upper_wick_ratio = 0
-            lower_wick_ratio = 0
-            body_ratio = 0
-
-        bullish_points = 0
-        bearish_points = 0
-
-        evidence = []
-        warnings = []
-
-        if trend_up:
-            bullish_points += 2
-            evidence.append("EMA20 above EMA50")
-
-        elif trend_down:
-            bearish_points += 2
-            evidence.append("EMA20 below EMA50")
-
-        if last_close > fast_value:
-            bullish_points += 1
-            evidence.append("Price above EMA20")
-
-        elif last_close < fast_value:
-            bearish_points += 1
-            evidence.append("Price below EMA20")
-
-        if last_close > recent_high:
-            bullish_points += 2
-            evidence.append("Recent high breakout")
-
-        elif last_close < recent_low:
-            bearish_points += 2
-            evidence.append("Recent low breakdown")
-
-        if lower_wick_ratio > 0.45 and last_close > candle_open:
-            bullish_points += 1
-            evidence.append("Strong lower wick rejection")
-
-        if upper_wick_ratio > 0.45 and last_close < candle_open:
-            bearish_points += 1
-            evidence.append("Strong upper wick rejection")
-
-        if last_close > previous_high:
-            bullish_points += 1
-            evidence.append("Close above previous high")
-
-        elif last_close < previous_low:
-            bearish_points += 1
-            evidence.append("Close below previous low")
-
-        volume_confirmation = False
-
-        if "Volume" in data.columns:
-            volume = pd.to_numeric(
-                data["Volume"],
-                errors="coerce"
-            ).fillna(0)
-
-            avg_volume = float(volume.iloc[-21:-1].mean())
-            current_volume = float(volume.iloc[-1])
-
-            if avg_volume > 0 and current_volume > avg_volume * 1.2:
-                volume_confirmation = True
-                evidence.append("Volume above recent average")
-
-        if bullish_points > bearish_points:
-            bias = "Bullish 🟢"
-            direction = 1
-        elif bearish_points > bullish_points:
-            bias = "Bearish 🔴"
-            direction = -1
-        else:
-            bias = "Neutral ⚪"
-            direction = 0
-
-        total_points = bullish_points + bearish_points
-
-        confidence = (
-            abs(bullish_points - bearish_points) /
-            max(total_points, 1)
-        ) * 100
-
-        confidence = round(
-            min(confidence, 95),
-            1
+    for col in required:
+        data[col] = pd.to_numeric(
+            data[col],
+            errors="coerce"
         )
 
-        if volume_confirmation:
-            confidence = min(
-                confidence + 5,
-                95
-            )
+    data = data.dropna(
+        subset=required
+    ).sort_index()
 
-        if direction == 0:
-            warnings.append("Conflicting directional evidence")
+    if len(data) < 30:
+        return None
 
-        if volatility_pct > 5:
-            warnings.append("High volatility detected")
+    return data
 
-        if body_ratio < 0.15:
-            warnings.append("Small candle body")
 
-        if direction == 0:
-            entry = last_close
-            sl = last_close
-            tp = last_close
+def _single_timeframe(df, timeframe):
+    data = _prepare(df)
+
+    if data is None:
+        return None
+
+    o = data["Open"]
+    h = data["High"]
+    l = data["Low"]
+    c = data["Close"]
+
+    last = float(c.iloc[-1])
+    prev = c.shift(1)
+
+    tr = pd.concat(
+        [
+            h - l,
+            (h - prev).abs(),
+            (l - prev).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    atr = float(
+        tr.rolling(14).mean().iloc[-1]
+    )
+
+    if (
+        not np.isfinite(last)
+        or last <= 0
+        or not np.isfinite(atr)
+        or atr <= 0
+    ):
+        return None
+
+    ema20 = c.ewm(
+        span=20,
+        adjust=False
+    ).mean()
+
+    ema50 = c.ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    ema200 = c.ewm(
+        span=200,
+        adjust=False
+    ).mean()
+
+    fast = float(ema20.iloc[-1])
+    slow = float(ema50.iloc[-1])
+    long_value = float(ema200.iloc[-1])
+
+    points_up = 0.0
+    points_down = 0.0
+    evidence = []
+
+    if fast > slow:
+        points_up += 2
+        evidence.append("EMA20 أعلى EMA50")
+
+    elif fast < slow:
+        points_down += 2
+        evidence.append("EMA20 أسفل EMA50")
+
+    if last > fast:
+        points_up += 1
+        evidence.append("الإغلاق أعلى EMA20")
+
+    elif last < fast:
+        points_down += 1
+        evidence.append("الإغلاق أسفل EMA20")
+
+    if last > long_value:
+        points_up += 1
+        evidence.append("الإغلاق أعلى EMA200")
+
+    elif last < long_value:
+        points_down += 1
+        evidence.append("الإغلاق أسفل EMA200")
+
+    prior_high = float(
+        h.iloc[-21:-1].max()
+    )
+
+    prior_low = float(
+        l.iloc[-21:-1].min()
+    )
+
+    if last > prior_high:
+        points_up += 2
+        evidence.append("إغلاق أعلى قمة آخر 20 شمعة")
+
+    elif last < prior_low:
+        points_down += 2
+        evidence.append("إغلاق أسفل قاع آخر 20 شمعة")
+
+    candle_range = max(
+        float(h.iloc[-1] - l.iloc[-1]),
+        1e-12
+    )
+
+    upper_wick = float(
+        h.iloc[-1] - max(o.iloc[-1], c.iloc[-1])
+    ) / candle_range
+
+    lower_wick = float(
+        min(o.iloc[-1], c.iloc[-1]) - l.iloc[-1]
+    ) / candle_range
+
+    if lower_wick >= 0.45 and c.iloc[-1] > o.iloc[-1]:
+        points_up += 0.75
+        evidence.append("رفض سعري بفتيل سفلي")
+
+    if upper_wick >= 0.45 and c.iloc[-1] < o.iloc[-1]:
+        points_down += 0.75
+        evidence.append("رفض سعري بفتيل علوي")
+
+    total = points_up + points_down
+
+    if points_up > points_down:
+        bias = "صاعد"
+
+    elif points_down > points_up:
+        bias = "هابط"
+
+    else:
+        bias = "محايد"
+
+    # درجة توازن الأدلة وليست احتمال نجاح.
+    confidence = (
+        abs(points_up - points_down) /
+        max(total, 1.0)
+    ) * 100
+
+    volatility = atr / last * 100
+
+    window = min(
+        160,
+        len(data)
+    )
+
+    recent = data.iloc[-window:]
+
+    lows = recent["Low"]
+    highs = recent["High"]
+
+    pivot_lows = []
+    pivot_highs = []
+
+    for i in range(2, len(recent) - 2):
+        low_value = float(lows.iloc[i])
+        high_value = float(highs.iloc[i])
+
+        if (
+            low_value <= float(lows.iloc[i-1])
+            and low_value <= float(lows.iloc[i-2])
+            and low_value < float(lows.iloc[i+1])
+            and low_value < float(lows.iloc[i+2])
+        ):
+            pivot_lows.append(low_value)
+
+        if (
+            high_value >= float(highs.iloc[i-1])
+            and high_value >= float(highs.iloc[i-2])
+            and high_value > float(highs.iloc[i+1])
+            and high_value > float(highs.iloc[i+2])
+        ):
+            pivot_highs.append(high_value)
+
+    return {
+        "timeframe": timeframe,
+        "bias": bias,
+        "confidence": round(float(confidence), 1),
+        "last_close": last,
+        "atr": atr,
+        "volatility_pct": volatility,
+        "structure": "قمم وقيعان مع اتجاه المتوسطات",
+        "evidence": evidence,
+        "bullish_points": points_up,
+        "bearish_points": points_down,
+        "support_candidates": pivot_lows[-25:],
+        "resistance_candidates": pivot_highs[-25:],
+        "last_time": data.index[-1].isoformat()
+    }
+
+
+def _cluster_levels(levels, tolerance):
+    if not levels:
+        return []
+
+    values = sorted(
+        float(x)
+        for x in levels
+        if np.isfinite(float(x)) and float(x) > 0
+    )
+
+    if not values:
+        return []
+
+    clusters = []
+    current = [values[0]]
+
+    for value in values[1:]:
+        center = float(np.mean(current))
+
+        if abs(value - center) <= tolerance:
+            current.append(value)
 
         else:
-            entry = last_close
+            clusters.append(current)
+            current = [value]
 
-            if direction == 1:
-                structural_stop = min(
-                    recent_low,
-                    candle_low
-                )
+    clusters.append(current)
 
-                sl = min(
-                    structural_stop,
-                    last_close - atr
-                )
+    return [
+        {
+            "price": round(float(np.mean(group)), 8),
+            "touches": len(group)
+        }
+        for group in clusters
+    ]
 
-                tp = last_close + (atr * 2)
 
-            else:
-                structural_stop = max(
-                    recent_high,
-                    candle_high
-                )
+def analyze_multitimeframe(bundle):
+    per_frame = {}
+    support_pool = []
+    resistance_pool = []
 
-                sl = max(
-                    structural_stop,
-                    last_close + atr
-                )
+    weighted_up = 0.0
+    weighted_down = 0.0
+    total_weight = 0.0
 
-                tp = last_close - (atr * 2)
+    warnings = []
+    available = 0
 
-        decimals = max(
-            0,
-            min(
-                10,
-                len(str(last_close).split(".")[-1])
-                if "." in str(last_close)
-                else 0
+    for timeframe in TIMEFRAMES:
+        item = bundle.get(timeframe, {})
+        df = item.get("data")
+
+        if df is None:
+            warnings.append(
+                f"{timeframe}: البيانات غير متاحة "
+                f"({item.get('status', 'unknown')})"
             )
+            continue
+
+        result = _single_timeframe(
+            df,
+            timeframe
         )
 
-        entry = round(entry, decimals)
-        sl = round(sl, decimals)
-        tp = round(tp, decimals)
+        if result is None:
+            warnings.append(
+                f"{timeframe}: البيانات غير كافية للتحليل"
+            )
+            continue
+
+        available += 1
+        per_frame[timeframe] = result
+
+        weight = TIMEFRAME_WEIGHTS.get(
+            timeframe,
+            1.0
+        )
+
+        total_weight += weight
+
+        if result["bias"] == "صاعد":
+            weighted_up += (
+                weight *
+                max(result["confidence"], 10) / 100
+            )
+
+        elif result["bias"] == "هابط":
+            weighted_down += (
+                weight *
+                max(result["confidence"], 10) / 100
+            )
+
+        support_pool.extend([
+            (x, weight, timeframe)
+            for x in result["support_candidates"]
+        ])
+
+        resistance_pool.extend([
+            (x, weight, timeframe)
+            for x in result["resistance_candidates"]
+        ])
+
+    if available == 0:
+        empty = _empty_result()
+        empty["warnings"] = warnings or empty["warnings"]
 
         return {
-            "bias": bias,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "confidence": confidence,
-            "volatility": round(volatility_pct, 3),
-            "atr": round(atr, decimals),
-            "structure": (
-                "Bullish structure"
-                if direction == 1
-                else "Bearish structure"
-                if direction == -1
-                else "Unclear structure"
-            ),
-            "evidence": evidence,
-            "warnings": warnings,
-            "bullish_points": bullish_points,
-            "bearish_points": bearish_points
+            "summary": empty,
+            "timeframes": {},
+            "warnings": warnings
         }
 
-    except Exception:
-        logger.exception("Analysis engine failed")
-        return neutral.copy()
+    current_price = per_frame.get(
+        "1d",
+        next(iter(per_frame.values()))
+    )["last_close"]
+
+    daily_atr = per_frame.get(
+        "1d",
+        {}
+    ).get("atr")
+
+    tolerance = max(
+        (daily_atr or current_price * 0.002) * 0.25,
+        current_price * 0.0005
+    )
+
+    supports = _cluster_levels(
+        [x[0] for x in support_pool],
+        tolerance
+    )
+
+    resistances = _cluster_levels(
+        [x[0] for x in resistance_pool],
+        tolerance
+    )
+
+    def enrich(levels, pool):
+        for level in levels:
+            related = [
+                (w, tf)
+                for price, w, tf in pool
+                if abs(price - level["price"]) <= tolerance
+            ]
+
+            level["timeframes"] = sorted(
+                set(tf for _, tf in related)
+            )
+
+            level["strength"] = round(
+                sum(w for w, _ in related),
+                2
+            )
+
+        return sorted(
+            levels,
+            key=lambda x: x["strength"],
+            reverse=True
+        )
+
+    supports = enrich(
+        supports,
+        support_pool
+    )[:8]
+
+    resistances = enrich(
+        resistances,
+        resistance_pool
+    )[:8]
+
+    net = weighted_up - weighted_down
+
+    balance = (
+        abs(net) /
+        max(total_weight, 1.0)
+    ) * 100
+
+    if net > 0.08:
+        final_bias = "الغلبة صاعدة"
+
+    elif net < -0.08:
+        final_bias = "الغلبة هابطة"
+
+    else:
+        final_bias = "متوازنة / متعارضة"
+
+    bullish_frames = [
+        tf
+        for tf, r in per_frame.items()
+        if r["bias"] == "صاعد"
+    ]
+
+    bearish_frames = [
+        tf
+        for tf, r in per_frame.items()
+        if r["bias"] == "هابط"
+    ]
+
+    if bullish_frames and bearish_frames:
+        conflict = True
+        warnings.append(
+            "يوجد تعارض بين بعض الفريمات؛ لا يجوز اختزاله في اتجاه واحد."
+        )
+
+    else:
+        conflict = False
+
+    evidence = [
+        f"الفريمات المتاحة للتحليل: {available} من {len(TIMEFRAMES)}",
+        f"الفريمات الصاعدة: {len(bullish_frames)}",
+        f"الفريمات الهابطة: {len(bearish_frames)}",
+        "وزن أعلى للفريمات الأكبر زمنيًا عند حساب الغلبة."
+    ]
+
+    summary = {
+        "bias": final_bias,
+        "confidence": round(balance, 1),
+        "score_type": "توازن الأدلة الموزونة، وليس احتمال نجاح",
+        "current_price_reference": current_price,
+        "available_timeframes": available,
+        "requested_timeframes": len(TIMEFRAMES),
+        "bullish_timeframes": bullish_frames,
+        "bearish_timeframes": bearish_frames,
+        "conflict": conflict,
+        "support": supports,
+        "resistance": resistances,
+        "evidence": evidence,
+        "warnings": warnings,
+        "structure": "متعدد الفريمات"
+    }
+
+    return {
+        "summary": summary,
+        "timeframes": per_frame,
+        "warnings": warnings
+    }
+
+
+def analyze_confluence(df):
+    """واجهة توافقية للتحليل بفريم واحد."""
+
+    result = _single_timeframe(
+        df,
+        "1h"
+    )
+
+    if result is None:
+        return _empty_result()
+
+    return {
+        "bias": result["bias"],
+        "entry": None,
+        "sl": None,
+        "tp": None,
+        "confidence": result["confidence"],
+        "volatility": round(
+            result["volatility_pct"],
+            3
+        ),
+        "atr": result["atr"],
+        "structure": result["structure"],
+        "evidence": result["evidence"],
+        "warnings": []
+    }
