@@ -11,24 +11,48 @@ from chart_drawer import generate_chart
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL_USERNAME = "@ICBVO"
+
+async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Error checking subscription: {e}")
+        return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
         "👋 أهلاً بك في بوت Institutional Code Breaker - ICB\n\n"
-        "أرسل اسم أي أداة مالية (مثل: XAUUSD, BTCUSD) للحصول على:\n"
+        "⚠️ **تنبيه هام:** يجب الانضمام لقناتنا الرسمية أولاً لتفعيل البوت واستخدام أدوات التحليل:\n"
+        "https://t.me/ICBVO\n\n"
+        "بعد الانضمام، أرسل اسم أي أداة مالية (مثل: XAUUSD, BTCUSD) للحصول على:\n"
         "1️⃣ جلب بيانات وحركة السوق الحية\n"
         "2️⃣ إجراء تحليل متكامل (CRT، جان، العرض والطلب)\n"
         "3️⃣ رسم الشارت مع مستويات الدخول، وقف الخسارة، والأهداف"
     )
-    await update.message.reply_text(welcome_msg)
+    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
 async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # التحقق من الاشتراك الإجباري أولاً
+    is_subscribed = await check_subscription(user_id, context)
+    if not is_subscribed:
+        await update.message.reply_text(
+            f"🚀 عذراً، لا يمكنك استخدام البوت إلا بعد الانضمام إلى قناتنا الرسمية أولاً:\n"
+            f"https://t.me/ICBVO\n\n"
+            f"انضم للقناة ثم أرسل اسم العملة مجدداً لتفعيل التحليل!"
+        )
+        return
+
     symbol = update.message.text.strip().upper()
     await update.message.reply_text(f"⏳ جاري تحليل {symbol} وحساب السيولة والمستويات...")
     try:
         data = fetch_market_data(symbol)
         
-        # التأكد الآمن من وجود البيانات بدون الوقوع في خطأ الـ DataFrame Ambiguity
         if data is None:
             await update.message.reply_text(f"❌ لم يتم العثور على بيانات لـ {symbol}")
             return
