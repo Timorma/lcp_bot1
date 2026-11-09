@@ -1,13 +1,31 @@
-
 import os
-import json
 import logging
+import asyncio
+
+from datetime import time as clock_time
+from zoneinfo import ZoneInfo
+
 from telegram import Update, BotCommand
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-from fetcher import fetch_market_data
-from analyzer import analyze_confluence
-from chart_drawer import generate_chart
+
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters
+)
+
 from openai import OpenAI
+
+from fetcher import (
+    fetch_market_bundle,
+    TIMEFRAMES
+)
+
+from analyzer import analyze_multitimeframe
+
+from chart_drawer import generate_timeframe_chart
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -16,9 +34,17 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 CHANNEL_USERNAME = "@ICBVO"
+
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+
+DAILY_UPDATE_HOUR = 3
+DAILY_UPDATE_MINUTE = 0
+
 
 ai_client = None
 
@@ -28,11 +54,44 @@ if GROQ_API_KEY:
         api_key=GROQ_API_KEY
     )
 
+
 AVAILABLE_MODELS = [
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b"
+    os.getenv(
+        "GROQ_MODEL",
+        "openai/gpt-oss-20b"
+    )
 ]
+
+
+def is_symbol_supported(symbol):
+    sym = symbol.strip().upper()
+
+    known = {
+        "XAUUSD",
+        "GOLD",
+        "XAGUSD",
+        "SILVER",
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "AUDUSD",
+        "USDCAD",
+        "NZDUSD",
+        "BTCUSDT",
+        "ETHUSDT",
+        "BNBUSDT",
+        "SOLUSDT",
+        "ADAUSDT",
+        "XRPUSDT"
+    }
+
+    return (
+        sym in known
+        or (
+            sym.endswith("USDT")
+            and len(sym) >= 6
+        )
+    )
 
 
 async def check_subscription(user_id, context):
@@ -42,101 +101,190 @@ async def check_subscription(user_id, context):
             user_id=user_id
         )
 
-        return member.status in [
+        return member.status in (
             "member",
             "administrator",
             "creator"
-        ]
+        )
 
     except Exception:
-        logger.exception("Subscription check failed")
+        logger.exception(
+            "Subscription check failed"
+        )
+
         return False
 
 
-def is_symbol_supported(symbol):
-    sym = symbol.strip().upper()
-    symbols_dir = "symbols"
+def _format_level(level):
+    price = level.get("price")
 
-    if os.path.exists(symbols_dir):
-        for filename in os.listdir(symbols_dir):
-            if not filename.endswith(".json"):
-                continue
+    if price is None:
+        return "غير متاح"
 
-            file_path = os.path.join(symbols_dir, filename)
-
-            try:
-                with open(file_path, "r", encoding="utf-8") as file:
-                    data = json.load(file)
-
-                for key, values in data.items():
-                    if isinstance(values, list):
-                        if sym in [
-                            str(value).upper()
-                            for value in values
-                        ]:
-                            return True
-
-                    elif isinstance(values, dict):
-                        if sym in [
-                            str(value).upper()
-                            for value in values.keys()
-                        ]:
-                            return True
-
-                        if sym in [
-                            str(value).upper()
-                            for value in values.values()
-                        ]:
-                            return True
-
-            except Exception:
-                logger.exception("Symbol file reading failed")
-
-    known_symbols = [
-        "XAUUSD",
-        "GOLD",
-        "GC=F",
-        "EURUSD",
-        "GBPUSD",
-        "USDJPY",
-        "AUDUSD",
-        "USDCAD",
-        "OIL",
-        "WTI",
-        "CL=F",
-        "SI=F",
-        "XAGUSD",
-        "BTCUSDT",
-        "ETHUSDT"
-    ]
+    frames = ", ".join(
+        level.get("timeframes", [])[:6]
+    ) or "غير محدد"
 
     return (
-        sym in known_symbols
-        or sym.endswith("=X")
-        or sym.endswith("=F")
-        or sym.startswith("^")
-        or sym.endswith("USDT")
+        f"{price:.8g} | "
+        f"قوة تجميع: {level.get('strength', 0)} | "
+        f"الفريمات: {frames}"
     )
 
 
-def consult_ai_brain(user_query):
+def build_report(symbol, result, bundle):
+    summary = result["summary"]
+
+    lines = [
+        f"📊 تقرير ICB البحثي — {symbol}",
+        "",
+        f"الخلاصة الزمنية: {summary.get('bias', 'غير محدد')}",
+        (
+            f"توازن الأدلة الموزونة: "
+            f"{summary.get('confidence', 0)}% "
+            f"(ليس احتمال نجاح)"
+        ),
+        (
+            f"الفريمات المتاحة: "
+            f"{summary.get('available_timeframes', 0)}/"
+            f"{summary.get('requested_timeframes', len(TIMEFRAMES))}"
+        ),
+        (
+            f"المرجع السعري من آخر إغلاق يومي/متاح: "
+            f"{summary.get('current_price_reference', 'غير متاح')}"
+        ),
+        "",
+        "🧭 توافق الفريمات:",
+        (
+            f"الصاعدة: "
+            f"{', '.join(summary.get('bullish_timeframes', [])) or 'لا يوجد'}"
+        ),
+        (
+            f"الهابطة: "
+            f"{', '.join(summary.get('bearish_timeframes', [])) or 'لا يوجد'}"
+        ),
+        (
+            f"التعارض: "
+            f"{'موجود' if summary.get('conflict') else 'غير ظاهر'}"
+        ),
+        "",
+        "🟢 أقوى مناطق الدعم المرصودة:"
+    ]
+
+    supports = summary.get(
+        "support",
+        []
+    )
+
+    lines.extend(
+        [
+            f"• {_format_level(x)}"
+            for x in supports[:5]
+        ] or [
+            "• لا توجد مستويات كافية"
+        ]
+    )
+
+    lines += [
+        "",
+        "🔴 أقوى مناطق المقاومة المرصودة:"
+    ]
+
+    resistances = summary.get(
+        "resistance",
+        []
+    )
+
+    lines.extend(
+        [
+            f"• {_format_level(x)}"
+            for x in resistances[:5]
+        ] or [
+            "• لا توجد مستويات كافية"
+        ]
+    )
+
+    lines += [
+        "",
+        "🕒 حالة الفريمات:"
+    ]
+
+    for tf in TIMEFRAMES:
+        item = bundle.get(
+            tf,
+            {}
+        )
+
+        frame = result.get(
+            "timeframes",
+            {}
+        ).get(tf)
+
+        if frame:
+            lines.append(
+                f"• {tf}: {frame['bias']} | "
+                f"توازن أدلة {frame['confidence']}% | "
+                f"آخر شمعة {frame['last_time']}"
+            )
+
+        else:
+            lines.append(
+                f"• {tf}: غير متاح "
+                f"({item.get('status', 'unknown')})"
+            )
+
+    warnings = summary.get(
+        "warnings",
+        []
+    )
+
+    if warnings:
+        lines += [
+            "",
+            "⚠️ ملاحظات جودة البيانات والتعارض:"
+        ]
+
+        lines.extend(
+            [
+                f"• {w}"
+                for w in warnings[:12]
+            ]
+        )
+
+    lines += [
+        "",
+        "الخلاصة النهائية:",
+        (
+            "هذه قراءة بحثية مبنية على البيانات المتاحة وقت الفحص. "
+            "تُعرض الاتجاهات والمستويات كاحتمالات وصفية وليست توصية "
+            "بتنفيذ صفقة أو ضمانًا للمستقبل."
+        )
+    ]
+
+    return "\n".join(lines)
+
+
+def consult_ai_brain(report):
     if not ai_client:
-        return "🧠 عقل الذكاء الاصطناعي غير متصل. تحقق من GROQ_API_KEY."
+        return (
+            "التحليل الآلي النصي غير متصل؛ "
+            "التقرير الرقمي متعدد الفريمات متاح أعلاه."
+        )
 
     system_prompt = (
-        "أنت المحلل البحثي الرئيسي في Institutional Code Breaker ICB. "
-        "حلل بيانات السوق المقدمة لك بعقلية بحثية مستقلة. "
-        "استخدم حركة السعر والسيولة والقمم والقيعان والفتائل والتذبذب. "
-        "لا تخترع أسعارًا أو بيانات غير موجودة. "
-        "ميّز بين آخر إغلاق مسجل والسعر اللحظي. "
-        "اذكر الأدلة التي تدعم قراءتك والأدلة التي تعارضها. "
-        "لا تقدم يقينًا بشأن المستقبل."
+        "أنت مساعد بحثي لـ ICB. "
+        "لخص التقرير المرفق فقط. "
+        "لا تخترع أسعارًا أو فريمات أو مستويات. "
+        "وضح التعارضات ونقص البيانات. "
+        "لا تقدم أوامر شراء أو بيع أو نقاط دخول أو وقف خسارة "
+        "أو أهداف تنفيذية. "
+        "لا تصف درجة توازن الأدلة بأنها احتمال نجاح."
     )
 
-    for model_name in AVAILABLE_MODELS:
+    for model in AVAILABLE_MODELS:
         try:
             response = ai_client.chat.completions.create(
-                model=model_name,
+                model=model,
                 messages=[
                     {
                         "role": "system",
@@ -144,254 +292,267 @@ def consult_ai_brain(user_query):
                     },
                     {
                         "role": "user",
-                        "content": user_query
+                        "content": report
                     }
                 ],
-                temperature=0.4,
-                max_tokens=1000,
-                timeout=30
+                temperature=0.2,
+                max_tokens=700,
+                timeout=35
             )
 
-            if response and response.choices:
-                answer = response.choices[0].message.content
-
-                if answer:
-                    return answer
+            if (
+                response.choices
+                and response.choices[0].message.content
+            ):
+                return response.choices[0].message.content.strip()
 
         except Exception:
             logger.exception(
                 "Groq model failed: %s",
-                model_name
+                model
             )
 
-    return "تعذر الاتصال بنماذج التحليل حاليًا."
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_msg = (
-        "🔥 *أهلاً بك في العقل السيبراني لـ ICB*\n\n"
-        "⚠️ اشترك في القناة لتفعيل البوت:\n"
-        "https://t.me/ICBVO\n\n"
-        "🤖 *طريقة الاستخدام:*\n"
-        "1. أرسل رمز الأداة المالية مثل XAUUSD أو BTCUSDT.\n"
-        "2. سيحاول البوت جلب البيانات وإنشاء الشارت.\n"
-        "3. يمكنك أيضًا طرح أسئلة تحليلية واستفسارات."
+    return (
+        "تعذر الحصول على الملخص النصي من Groq؛ "
+        "راجع التقرير الرقمي أعلاه."
     )
+
+
+async def _run_analysis(symbol):
+    bundle = await asyncio.to_thread(
+        fetch_market_bundle,
+        symbol
+    )
+
+    result = analyze_multitimeframe(bundle)
+
+    report = build_report(
+        symbol,
+        result,
+        bundle
+    )
+
+    ai_summary = await asyncio.to_thread(
+        consult_ai_brain,
+        report
+    )
+
+    chart = generate_timeframe_chart(
+        bundle,
+        result,
+        symbol
+    )
+
+    return (
+        bundle,
+        result,
+        report,
+        ai_summary,
+        chart
+    )
+
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not update.message:
+        return
 
     await update.message.reply_text(
-        welcome_msg,
-        parse_mode="Markdown"
+        "🔥 أهلًا بك في ICB Research Engine\n\n"
+        "يشترط الاشتراك في القناة أولًا:\n"
+        "https://t.me/ICBVO\n\n"
+        "أرسل رمزًا مثل XAUUSD أو BTCUSDT للحصول على تقرير "
+        "متعدد الفريمات من الدقيقة حتى 144 يومًا، "
+        "حسب توفر البيانات."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not update.message or not update.message.text:
         return
 
     user_id = update.effective_user.id
 
-    if not await check_subscription(user_id, context):
+    if not await check_subscription(
+        user_id,
+        context
+    ):
         await update.message.reply_text(
-            "🚀 يجب الانضمام لقناتنا الرسمية أولاً:\n"
+            "🚀 يجب الانضمام إلى القناة الرسمية أولًا:\n"
             "https://t.me/ICBVO"
         )
+
         return
 
     text = update.message.text.strip()
-    words = text.split()
-    symbol = text.upper()
 
-    is_symbol_request = (
-        len(words) == 1
-        and words[0].isascii()
-        and len(text) <= 10
-        and is_symbol_supported(symbol)
-    )
+    if (
+        len(text.split()) == 1
+        and is_symbol_supported(text)
+    ):
+        symbol = text.upper()
 
-    if is_symbol_request:
-        status_message = await update.message.reply_text(
-            f"⏳ جارٍ جلب بيانات {symbol} والتحقق من الشارت..."
+        status = await update.message.reply_text(
+            f"⏳ جارٍ فحص الفريمات والبيانات المتاحة للأداة {symbol}..."
         )
 
         try:
-            data = fetch_market_data(symbol)
+            (
+                bundle,
+                result,
+                report,
+                ai_summary,
+                chart
+            ) = await _run_analysis(symbol)
 
-            if data is None or data.empty:
-                await status_message.edit_text(
-                    f"❌ لم أتمكن من جلب بيانات صالحة للرمز {symbol}."
+            if chart is not None:
+                await update.message.reply_photo(
+                    photo=chart,
+                    caption=(
+                        f"ICB | {symbol}\n"
+                        f"{result['summary']['bias']}\n"
+                        f"الفريمات المتاحة: "
+                        f"{result['summary']['available_timeframes']}/"
+                        f"{result['summary']['requested_timeframes']}"
+                    )
                 )
-                return
 
-            analysis = analyze_confluence(data)
-
-            if not isinstance(analysis, dict):
-                raise ValueError("Invalid analyzer result")
-
-            latest_time = data.index[-1]
-            latest_close = float(data["Close"].iloc[-1])
-
-            source = data.attrs.get(
-                "source",
-                "Unknown"
+            full_text = (
+                report +
+                "\n\n🧠 الملخص البحثي:\n" +
+                ai_summary
             )
 
-            source_symbol = data.attrs.get(
-                "source_symbol",
-                symbol
-            )
-
-            ai_prompt = (
-                f"الأداة: {symbol}\n"
-                f"مصدر البيانات: {source}\n"
-                f"رمز المصدر: {source_symbol}\n"
-                f"الفريم: {data.attrs.get('interval', 'Unknown')}\n"
-                f"وقت آخر شمعة: {latest_time}\n"
-                f"آخر إغلاق مسجل: {latest_close}\n\n"
-                f"بيانات آخر 20 شمعة:\n"
-                f"{data.tail(20).to_string()}\n\n"
-                "حلل السلوك والاتجاه والتذبذب والفتائل والسيولة. "
-                "اذكر حدود البيانات، ولا تعتبر آخر إغلاق سعرًا لحظيًا."
-            )
-
-            ai_insight = consult_ai_brain(ai_prompt)
-
-            chart_buf = generate_chart(data, analysis)
-
-            if chart_buf is None:
-                await status_message.edit_text(
-                    "⚠️ البيانات والتحليل جاهزان، لكن إنشاء الشارت فشل. "
-                    "راجع أخطاء chart_drawer.py في Railway."
+            for start_index in range(
+                0,
+                len(full_text),
+                3900
+            ):
+                await update.message.reply_text(
+                    full_text[
+                        start_index:start_index + 3900
+                    ]
                 )
-                return
 
-            if hasattr(chart_buf, "seek"):
-                chart_buf.seek(0)
-
-            caption = (
-                f"📊 *تحليل {symbol} - ICB*\n\n"
-                f"🔹 الاتجاه: {analysis.get('bias', 'N/A')}\n"
-                f"آخر إغلاق: {latest_close}\n"
-                f"🕒 آخر شمعة: {latest_time}\n"
-                f"📡 المصدر: {source}\n\n"
-                f"🧠 *قراءة البيانات:*\n"
-                f"{ai_insight[:700]}"
-            )
-
-            await update.message.reply_photo(
-                photo=chart_buf,
-                caption=caption,
-                parse_mode="Markdown"
-            )
-
-            await status_message.delete()
+            await status.delete()
 
         except Exception:
             logger.exception(
-                "Symbol analysis or chart delivery failed"
+                "User analysis failed for %s",
+                symbol
             )
 
-            try:
-                await status_message.edit_text(
-                    "❌ حدث خطأ أثناء التحليل أو إرسال الشارت. "
-                    "راجع سجل Railway."
-                )
-            except Exception:
-                logger.exception("Could not update status message")
+            await status.edit_text(
+                "❌ حدث خطأ أثناء التحليل. راجع سجل Railway."
+            )
 
         return
 
     await update.message.reply_text(
-        "🧠 العقل السيبراني يحلل سؤالك..."
+        "أرسل رمز أداة مدعوم مثل XAUUSD أو BTCUSDT "
+        "للحصول على التقرير متعدد الفريمات."
     )
 
-    ai_reply = consult_ai_brain(text)
 
-    await update.message.reply_text(ai_reply)
-
-
-async def send_hourly_updates(context: ContextTypes.DEFAULT_TYPE):
-    symbols_to_update = [
+async def send_daily_updates(
+    context: ContextTypes.DEFAULT_TYPE
+):
+    for symbol in (
         "XAUUSD",
         "BTCUSDT"
-    ]
-
-    for symbol in symbols_to_update:
+    ):
         try:
-            data = fetch_market_data(symbol)
+            (
+                bundle,
+                result,
+                report,
+                ai_summary,
+                chart
+            ) = await _run_analysis(symbol)
 
-            if data is None or data.empty:
+            daily = bundle.get(
+                "1d",
+                {}
+            ).get("data")
+
+            if daily is None or daily.empty:
                 logger.warning(
-                    "No data available for hourly update: %s",
+                    "Daily candle unavailable; skipping %s",
                     symbol
                 )
+
                 continue
 
-            analysis = analyze_confluence(data)
-
-            if not isinstance(analysis, dict):
-                logger.error(
-                    "Invalid analysis for %s",
-                    symbol
+            if chart is not None:
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_USERNAME,
+                    photo=chart,
+                    caption=(
+                        f"🌅 تحديث ICB اليومي — {symbol}\n"
+                        f"{result['summary']['bias']}\n"
+                        "03:00 صباحًا بتوقيت القاهرة"
+                    )
                 )
-                continue
 
-            chart_buf = generate_chart(data, analysis)
-
-            if chart_buf is None:
-                logger.error(
-                    "Chart generation failed for %s",
-                    symbol
-                )
-                continue
-
-            if hasattr(chart_buf, "seek"):
-                chart_buf.seek(0)
-
-            latest_close = float(data["Close"].iloc[-1])
-            latest_time = data.index[-1]
-
-            caption = (
-                f"⏰ *تحديث ICB الدوري*\n\n"
-                f"📊 الأصل: {symbol}\n"
-                f"🔹 الاتجاه: {analysis.get('bias', 'N/A')}\n"
-                f"آخر إغلاق: {latest_close}\n"
-                f"🕒 آخر شمعة: {latest_time}"
+            full_text = (
+                report +
+                "\n\n🧠 الملخص البحثي:\n" +
+                ai_summary
             )
 
-            await context.bot.send_photo(
-                chat_id=CHANNEL_USERNAME,
-                photo=chart_buf,
-                caption=caption,
-                parse_mode="Markdown"
-            )
+            for start_index in range(
+                0,
+                len(full_text),
+                3900
+            ):
+                await context.bot.send_message(
+                    chat_id=CHANNEL_USERNAME,
+                    text=full_text[
+                        start_index:start_index + 3900
+                    ]
+                )
 
         except Exception:
             logger.exception(
-                "Hourly update failed for %s",
+                "Daily update failed for %s",
                 symbol
             )
 
 
 async def post_init(application):
-    commands = [
+    await application.bot.set_my_commands([
         BotCommand(
             "start",
             "تشغيل البوت وعرض التعليمات"
         )
-    ]
-
-    await application.bot.set_my_commands(commands)
+    ])
 
     job_queue = application.job_queue
 
     if job_queue:
-        job_queue.run_repeating(
-            send_hourly_updates,
-            interval=3600,
-            first=10
+        job_queue.run_daily(
+            send_daily_updates,
+            time=clock_time(
+                hour=DAILY_UPDATE_HOUR,
+                minute=DAILY_UPDATE_MINUTE,
+                tzinfo=CAIRO_TZ
+            ),
+            name="icb_daily_market_report"
         )
+
+        logger.info(
+            "Daily reports scheduled for 03:00 Africa/Cairo"
+        )
+
     else:
-        logger.error("Job queue is not available")
+        logger.error(
+            "Job queue unavailable; install python-telegram-bot[job-queue]"
+        )
 
 
 async def error_handler(update, context):
@@ -403,7 +564,10 @@ async def error_handler(update, context):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN is missing")
+        logger.error(
+            "TELEGRAM_BOT_TOKEN is missing"
+        )
+
         return
 
     app = (
@@ -414,7 +578,10 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     app.add_handler(
@@ -424,9 +591,13 @@ def main():
         )
     )
 
-    app.add_error_handler(error_handler)
+    app.add_error_handler(
+        error_handler
+    )
 
-    logger.info("ICB Bot is starting")
+    logger.info(
+        "ICB Multi-Timeframe Bot starting"
+    )
 
     app.run_polling()
 
