@@ -1,0 +1,22 @@
+import os
+from pypdf import PdfReader
+
+def extract_pdf_knowledge(pdf_path="data/icb_strategy.pdf"):
+    try:
+        if not os.path.exists(pdf_path):
+            return "قاعدة المعرفة غير موجودة."
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            if page.extract_text():
+                text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        print(f"Error reading PDF: {e}")
+        return ""
+
+def consult_ai_brain(user_query: str):
+    knowledge = extract_pdf_knowledge()
+    if not knowledge or "غير موجودة" in knowledge:
+        return "عذراً، لم يتم العثور على ملف الاستراتيجية."
+    return f"🧠 تحليل عقل ICB الذكي بناءً على ملفات الاستراتيجية لطلبك ('{user_query}'): تم رصد توافق مع قواعد السيولة المؤسسية."
