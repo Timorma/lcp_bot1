@@ -1,47 +1,185 @@
 import io
+import logging
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import pandas as pd
 
-def generate_chart(df: pd.DataFrame, analysis: dict):
-    try:
-        if df is None or df.empty:
-            return None
+logger = logging.getLogger(__name__)
 
-        # إنشاء الرسم البياني المالي بدقة عالية
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
-        
-        # رسم حركة السعر الحقيقية على فريم 144 دقيقة
-        ax.plot(df.index, df['Close'], label='ICB Price (144m)', color='#1f77b4', linewidth=2)
-        
-        # استخراج المستويات من التحليل
-        entry = analysis.get('entry')
-        sl = analysis.get('sl')
-        tp = analysis.get('tp')
-        bias = analysis.get('bias', 'Neutral')
-        
-        # رسم خطوط المستويات المؤسسية لو متوفرة
-        if entry:
-            ax.axhline(y=entry, color='blue', linestyle='--', label=f'Entry: {entry}')
-        if sl:
-            ax.axhline(y=sl, color='red', linestyle=':', label=f'SL: {sl}')
-        if tp:
-            ax.axhline(y=tp, color='green', linestyle=':', label=f'TP: {tp}')
-            
-        ax.set_title(f'ICB Framework - 144m Live Chart | Bias: {bias}', fontsize=12, fontweight='bold', color='#333333')
-        ax.grid(True, linestyle='--', alpha=0.5)
-        ax.legend(loc='upper left', fontsize=9)
-        
-        plt.tight_layout()
-        
-        # حفظ الشارت في ذاكرة البايثون لإرساله مباشرة لتليجرام
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        plt.close(fig)
-        
-        return buf
-    except Exception as e:
-        print(f"Error generating chart: {e}")
+
+def generate_chart(
+    df: pd.DataFrame,
+    analysis: dict,
+    symbol="ASSET",
+    timeframe="1d"
+):
+    if df is None or df.empty:
         return None
+
+    fig = None
+
+    try:
+        data = df.tail(220).copy()
+
+        fig, ax = plt.subplots(
+            figsize=(13, 7),
+            dpi=130
+        )
+
+        ax.plot(
+            data.index,
+            data["Close"],
+            label=f"{symbol} close ({timeframe})",
+            linewidth=1.8,
+            color="#2463a6"
+        )
+
+        summary = analysis.get(
+            "summary",
+            analysis
+        )
+
+        current = summary.get(
+            "current_price_reference"
+        )
+
+        for level in summary.get("support", [])[:5]:
+            price = level.get("price")
+
+            if price is not None:
+                ax.axhline(
+                    price,
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.8,
+                    color="#16845b",
+                    label=(
+                        f"Support {price:.6g} | "
+                        f"{level.get('strength', 0)}"
+                    )
+                )
+
+        for level in summary.get("resistance", [])[:5]:
+            price = level.get("price")
+
+            if price is not None:
+                ax.axhline(
+                    price,
+                    linestyle=":",
+                    linewidth=1.0,
+                    alpha=0.8,
+                    color="#c34b4b",
+                    label=(
+                        f"Resistance {price:.6g} | "
+                        f"{level.get('strength', 0)}"
+                    )
+                )
+
+        if current is not None:
+            ax.axhline(
+                current,
+                color="#d69e2e",
+                linewidth=1.0,
+                alpha=0.7,
+                label=f"Reference close {current:.6g}"
+            )
+
+        ax.set_title(
+            f"ICB Multi-Timeframe Research | {symbol} | {timeframe}\n"
+            f"{summary.get('bias', 'غير محدد')}",
+            fontsize=12,
+            fontweight="bold"
+        )
+
+        ax.set_ylabel("Price")
+
+        ax.grid(
+            True,
+            linestyle="--",
+            alpha=0.25
+        )
+
+        ax.xaxis.set_major_formatter(
+            mdates.DateFormatter("%Y-%m-%d")
+        )
+
+        ax.tick_params(
+            axis="x",
+            rotation=25
+        )
+
+        handles, labels = ax.get_legend_handles_labels()
+
+        if handles:
+            unique = dict(
+                zip(labels, handles)
+            )
+
+            ax.legend(
+                unique.values(),
+                unique.keys(),
+                loc="best",
+                fontsize=8
+            )
+
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+
+        fig.savefig(
+            buf,
+            format="png",
+            bbox_inches="tight"
+        )
+
+        buf.seek(0)
+
+        return buf
+
+    except Exception:
+        logger.exception("Chart generation failed")
+
+        if fig is not None:
+            plt.close(fig)
+
+        return None
+
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+def generate_timeframe_chart(
+    bundle,
+    analysis,
+    symbol
+):
+    daily = bundle.get(
+        "1d",
+        {}
+    ).get("data")
+
+    if daily is not None and not daily.empty:
+        return generate_chart(
+            daily,
+            analysis,
+            symbol=symbol,
+            timeframe="1d"
+        )
+
+    for timeframe in reversed(list(bundle.keys())):
+        data = bundle[timeframe].get("data")
+
+        if data is not None and not data.empty:
+            return generate_chart(
+                data,
+                analysis,
+                symbol=symbol,
+                timeframe=timeframe
+            )
+
+    return None
