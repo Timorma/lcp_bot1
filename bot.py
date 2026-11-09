@@ -66,8 +66,8 @@ def consult_ai_brain(user_query: str) -> str:
         return "🧠 عقل الـ AI غير متصل حالياً (يرجى التأكد من إضافة GROQ_API_KEY في Railway)."
     
     system_prompt = (
-        "أنت المحليل الرئيسي لمدرسة Institutional Code Breaker (ICB). "
-        "تتكلم بثقة وتفهم تحليل السيولة، صانع السوق، وفريم 144 دقيقة. أجب باحترافية باللغة العربية."
+        "أنت المحلل المالي المؤسسي وموجه مدرسة Institutional Code Breaker (ICB). "
+        "تتكلم بثقة تامة، تفهم تحليل السيولة، صانع السوق، وفريم 144 دقيقة. أجب على الأسئلة المالية وتحليل الأسواق باحترافية وعمق باللغة العربية."
     )
     
     try:
@@ -76,13 +76,16 @@ def consult_ai_brain(user_query: str) -> str:
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
-            ]
+            ],
+            temperature=0.7,
+            max_tokens=800
         )
         if response and response.choices:
             return response.choices[0].message.content
     except Exception as e:
         logging.error(f"Groq AI Detailed Error: {e}")
-        
+        return f"عذراً يا فنان، حدث خطأ تقني في الاتصال بالعقل السيبراني: {str(e)}"
+    
     return "مرحباً يا فنان، أنا جاهز لتحليلات الـ ICB والسيولة المؤسسية، تفضل بطرح سؤالك."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
