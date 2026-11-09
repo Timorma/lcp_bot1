@@ -1,5 +1,7 @@
-openai
-python-telegram-bot
-yfinance
+python-telegram-bot[job-queue]>=21.0
+openai>=1.0.0
 pandas
 matplotlib
+numpy
+yfinance
+# أضف أي مكتبات تانية بتستخدمها في fetcher / analyzer / chart_drawer
