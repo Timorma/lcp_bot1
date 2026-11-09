@@ -8,7 +8,6 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from fetcher import fetch_market_data
 from analyzer import analyze_confluence
 from chart_drawer import generate_chart
-from ai_brain import consult_ai_brain
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -18,7 +17,6 @@ CHANNEL_USERNAME = "@ICBVO"
 async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        logging.info(f"User {user_id} subscription status: {member.status}")
         if member.status in ['member', 'administrator', 'creator']:
             return True
         return False
@@ -27,7 +25,6 @@ async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> boo
         return False
 
 def is_symbol_supported(symbol: str) -> bool:
-    """قراءة كل مجلدات وملفات الأصول (بينانس، فوركس، معادن، ومؤشرات) بذكاء تام"""
     sym = symbol.strip().upper()
     symbols_dir = "symbols"
     
@@ -48,12 +45,20 @@ def is_symbol_supported(symbol: str) -> bool:
                 except Exception:
                     continue
                     
-    # الرموز المباشرة المعروفة والسلع والفوركس
     known_directs = ["XAUUSD", "GOLD", "GC=F", "EURUSD", "GBPUSD", "OIL", "WTI", "CL=F", "SI=F", "XAGUSD"]
     if sym in known_directs or sym.endswith("=X") or sym.endswith("=F") or sym.startswith("^"):
         return True
         
     return False
+
+def consult_ai_brain(user_query: str):
+    strategy_rules = (
+        "قواعد استراتيجية ICB (Institutional Code Breaker):\n"
+        "- الاعتماد على فريم 144 دقيقة لدراسة الدورات المؤسسية وحركة صانع السوق.\n"
+        "- تتبع الصفقات غير المكتملة ومناطق السيولة المتمثلة في Order Blocks.\n"
+        "- دمج تحليل الفوليوم (Volume Profile) لتحديد نقاط الانعكاس بدقة."
+    )
+    return f"🧠 تحليل عقل ICB المؤسسي لطلبك ('{user_query}'):\n{strategy_rules}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
@@ -70,7 +75,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # التحقق من الاشتراك الإجباري
     is_subscribed = await check_subscription(user_id, context)
     if not is_subscribed:
         await update.message.reply_text(
@@ -82,7 +86,6 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     symbol = update.message.text.strip().upper()
     
-    # فحص الرمز في الملفات المتاحة
     if not is_symbol_supported(symbol) and not symbol.endswith("USDT") and "=" not in symbol:
         await update.message.reply_text(f"⚠️ تنبيه: الرمز '{symbol}' قد غير مسجل في القوائم الرسمية، ولكن جاري محاولة جلب بياناته...")
 
@@ -95,13 +98,8 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ لم يتم العثور على بيانات لـ {symbol}. تأكد من صحة الرمز.")
             return
         
-        # استدعاء التحليل الفني والسيولة
         analysis = analyze_confluence(data)
-        
-        # استدعاء عقل الذكاء الاصطناعي من ملف الاستراتيجية (PDF / Text)
         ai_insight = consult_ai_brain(f"تحليل الرمز {symbol}")
-        
-        # رسم الشارت المؤسسي
         chart_buf = generate_chart(data, analysis)
         
         if chart_buf is None:
@@ -135,7 +133,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_analysis))
-    print("Bot is running with full ICB & AI Integration...")
+    print("Bot is running with full ICB Integration...")
     app.run_polling()
 
 if __name__ == '__main__':
