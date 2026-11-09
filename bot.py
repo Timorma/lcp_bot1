@@ -7,17 +7,22 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from fetcher import fetch_market_data
 from analyzer import analyze_confluence
 from chart_drawer import generate_chart
-import google.generativeai as genai
+from openai import OpenAI
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# هنستبدل مفتاح جوجل بمفتاح Groq المجاني السريع
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_USERNAME = "@ICBVO"
 
-# إعداد مكتبة جوجل بالطريقة الكلاسيكية المستقرة
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# إعداد عقل الذكاء الاصطناعي الحر (Groq Client)
+ai_client = None
+if GROQ_API_KEY:
+    ai_client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=GROQ_API_KEY
+    )
 
 async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -57,38 +62,41 @@ def is_symbol_supported(symbol: str) -> bool:
     return False
 
 def consult_ai_brain(user_query: str) -> str:
-    """استشارة نموذج جوجل للإجابة على الأسئلة أو تحليل السوق"""
-    if not GEMINI_API_KEY:
-        return "🧠 نموذج الذكاء الاصطناعي غير متصل (يرجى التأكد من إضافة GEMINI_API_KEY في Railway)."
+    """عقل ثماني النواه ومحلل مالي مؤسسي يتحرر من القيود التقليدية"""
+    if not ai_client:
+        return "🧠 عقل الـ AI غير متصل حالياً (يرجى إضافة GROQ_API_KEY في متغيرات Railway)."
     
     system_prompt = (
-        "أنت مساعد ذكي ومحترف مخصص لمدرسة وتطبيق Institutional Code Breaker (ICB).\n"
-        "تتخصص في تحليل الأسواق المالية وفق سيولة المؤسسات، صانع السوق، فريم 144 دقيقة، ومناطق Order Blocks.\n"
-        "أجب عن أسئلة المستخدم بأسلوب دقيق، احترافي، وواضح باللغة العربية."
+        "أنت العقل التوجيهي والمحلل الرئيسي لمدرسة Institutional Code Breaker (ICB).\n"
+        "لست مساعداً آلياً تقليدياً، بل خبير تداول مؤسسي ومحلل أسواق محنك.\n"
+        "تتكلم بثقة، تفهم لغة المتحدث بعمق (سواء كانت فصحى أو عامية تداول)، وتغوص في سيولة صانع السوق، "
+        "فريم 144 دقيقة، وأماكن تمركز عقود المؤسسات (Order Blocks & Liquidity Pools).\n"
+        "أجب باحترافية، وكن محللاً ذكياً يفكر خارج الصندوق."
     )
     
-    models_to_try = ["gemini-1.5-flash", "gemini-pro"]
-    
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(f"{system_prompt}\n\nطلب المستخدم: {user_query}")
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            logging.error(f"AI Error with model {model_name}: {e}")
-            continue
-            
-    return "عذراً، حدث خطأ في معالجة طلب الذكاء الاصطناعي. تأكد من صحة المفتاح."
+    try:
+        response = ai_client.chat.completions.create(
+            model="llama-3.3-70b-versatile", # نموذج جبار وذكي جداً ومجاني بالكامل عبر Groq
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query}
+            ],
+            temperature=0.7,
+            max_tokens=800
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"Groq AI Error: {e}")
+        return "عذراً يا فنان، حدثت استجابة غير متوقعة من العقل السيبراني، جرب مرة أخرى."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
-        "👋 أهلاً بك في بوت Institutional Code Breaker - ICB\n\n"
-        "⚠️ **تنبيه هام:** يجب الانضمام لقناتنا الرسمية أولاً لتفعيل البوت واستخدام أدوات التحليل:\n"
+        "🔥 **أهلاً بك في العقل السيبراني لـ Institutional Code Breaker (ICB)**\n\n"
+        "⚠️ **تنبيه هام:** اشترك في قناتنا أولاً لتفعيل الطاقة الكاملة للبوت:\n"
         "https://t.me/ICBVO\n\n"
-        "🤖 **طريقة الاستخدام:**\n"
-        "1️⃣ أرسل رمز أي أصل مالي (مثل: `XAUUSD`, `BTCUSDT`) للحصول على الشارت وتحليل السيولة.\n"
-        "2️⃣ أرسل أي سؤال أو استفسار عن التداول والاستراتيجية وسيرد عليك الذكاء الاصطناعي فوراً!"
+        "🤖 **طريقة التعامل:**\n"
+        "1️⃣ اكتب أي رمز أصل مالي (مثل `XAUUSD`, `BTCUSDT`) لسحب الشارت وتحليله فريماً بفريم.\n"
+        "2️⃣ ناقشني في أي استراتيجية، سيولة، أو تحليل وسأرد عليك كمحلل مؤسسي محترف يقرأ ما بين السطور!"
     )
     await update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
@@ -98,9 +106,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_subscribed = await check_subscription(user_id, context)
     if not is_subscribed:
         await update.message.reply_text(
-            f"🚀 عذراً، لا يمكنك استخدام البوت إلا بعد الانضمام إلى قناتنا الرسمية أولاً:\n"
-            f"https://t.me/ICBVO\n\n"
-            f"انضم للقناة ثم أرسل الطلب مجدداً!"
+            f"🚀 عذراً، يجب الانضمام لقناتنا الرسمية أولاً لتفعيل البوت:\n"
+            f"https://t.me/ICBVO"
         )
         return
 
@@ -108,16 +115,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words = text.split()
     symbol = text.upper()
     
-    # 🎯 التمييز الذكي: هل النص رمز مالي أم سؤال عام؟
+    # التمييز الذكي بين طلب الرمز المالي والتحليل الحواري
     is_symbol_request = (len(words) == 1 and words[0].isascii() and len(text) <= 10) or is_symbol_supported(symbol)
 
-    if is_symbol_request and not any(c in text for c in [' ', '؟', '?', 'اشرح', 'كيف', 'ما', 'لماذا']):
-        await update.message.reply_text(f"⏳ جاري تحليل {symbol} وحساب السيولة والمستويات عبر عقل ICB...")
+    if is_symbol_request and not any(c in text for c in [' ', '؟', '?', 'اشرح', 'كيف', 'ما', 'ليه', 'رايك']):
+        await update.message.reply_text(f"⏳ جارِ استخراج شارت {symbol} وغوص العقل المؤسسي في السيولة...")
         try:
             data = fetch_market_data(symbol)
             if data is not None and not data.empty:
                 analysis = analyze_confluence(data)
-                ai_insight = consult_ai_brain(f"قدم رؤية مؤسسية مختصرة لاتجاه رمز {symbol}.")
+                ai_insight = consult_ai_brain(f"قدم قراءة تحليلية عميقة لاتجاه وسلوك سعر رمز {symbol} بناءً على البيانات الحالية.")
                 chart_buf = generate_chart(data, analysis)
                 
                 if chart_buf is not None:
@@ -125,69 +132,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chart_buf.seek(0)
                     
                     caption = (
-                        f"📊 **تحليل {symbol} - ICB Framework**\n\n"
+                        f"📊 **تحليل سيولة {symbol} - ICB Framework**\n\n"
                         f"🔹 الاتجاه: {analysis.get('bias', 'N/A')}\n"
                         f"🎯 منطقة الدخول: {analysis.get('entry', 'N/A')}\n"
                         f"🛑 وقف الخسارة: {analysis.get('sl', 'N/A')}\n"
                         f"🎯 الأهداف: {analysis.get('tp', 'N/A')}\n\n"
-                        f"🧠 **رؤية العقل المؤسسي:**\n{ai_insight[:300]}"
+                        f"🧠 **قراءة العقل المؤسسي:**\n{ai_insight[:500]}"
                     )
                     await update.message.reply_photo(photo=chart_buf, caption=caption, parse_mode='Markdown')
                     return
         except Exception as e:
             logging.error(f"Analysis error: {e}")
 
-    # 🧠 إذا كان سؤالاً نصياً أو جملة عربية، يتم توجيهه لعقل الذكاء الاصطناعي مباشرة
-    await update.message.reply_text("🧠 جاري التفكير والإجابة عبر عقل الذكاء الاصطناعي...")
+    # محادثة ذكية وتحليل عميق خارج الصندوق
+    await update.message.reply_text("🧠 العقل السيبراني يحلل أبعاد سؤالك...")
     ai_reply = consult_ai_brain(text)
     await update.message.reply_text(ai_reply)
 
 async def send_hourly_updates(context: ContextTypes.DEFAULT_TYPE):
-    """وظيفة أوتوماتيكية يتم تشغيلها كل ساعة لإرسال تحديثات الذهب والبيتكوين للقناة"""
     symbols_to_update = ["XAUUSD", "BTCUSDT"]
-    
     for symbol in symbols_to_update:
         try:
             data = fetch_market_data(symbol)
             if data is not None and not data.empty:
                 analysis = analyze_confluence(data)
                 chart_buf = generate_chart(data, analysis)
-                
                 if chart_buf is not None:
                     if hasattr(chart_buf, 'seek'):
                         chart_buf.seek(0)
-                        
                     caption = (
-                        f"⏰ **تحديث تلقائي كل ساعة - ICB Framework**\n"
+                        f"⏰ **التحديث الساعي المؤسسي - ICB**\n"
                         f"📊 **الأصل:** {symbol}\n\n"
                         f"🔹 الاتجاه: {analysis.get('bias', 'N/A')}\n"
-                        f"🎯 منطقة الدخول: {analysis.get('entry', 'N/A')}\n"
-                        f"🛑 وقف الخسارة: {analysis.get('sl', 'N/A')}\n"
-                        f"🎯 الأهداف: {analysis.get('tp', 'N/A')}"
+                        f"🎯 الدخول: {analysis.get('entry', 'N/A')}\n"
+                        f"🛑 الوقف: {analysis.get('sl', 'N/A')}\n"
+                        f"🎯 الهدف: {analysis.get('tp', 'N/A')}"
                     )
                     await context.bot.send_photo(chat_id=CHANNEL_USERNAME, photo=chart_buf, caption=caption, parse_mode='Markdown')
         except Exception as e:
             logging.error(f"Error in hourly update for {symbol}: {e}")
 
 async def post_init(application):
-    commands = [
-        ("start", "بدء تشغيل بوت ICB وعرض التعليمات"),
-    ]
+    commands = [("start", "تشغيل البوت السيبراني وعرض التوجيهات")]
     await application.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in commands])
-    
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(send_hourly_updates, interval=3600, first=10)
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN environment variable is missing!")
+        print("Error: TELEGRAM_BOT_TOKEN is missing!")
         return
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot is running with AI Chat & Automated Updates...")
+    print("Cyber-Bot with Llama-3 AI is running...")
     app.run_polling()
 
 if __name__ == '__main__':
