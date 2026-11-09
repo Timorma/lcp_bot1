@@ -1,9 +1,8 @@
 import os
 import json
 import logging
-import io
 import traceback
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from fetcher import fetch_market_data
 from analyzer import analyze_confluence
@@ -45,8 +44,8 @@ def is_symbol_supported(symbol: str) -> bool:
                 except Exception:
                     continue
                     
-    known_directs = ["XAUUSD", "GOLD", "GC=F", "EURUSD", "GBPUSD", "OIL", "WTI", "CL=F", "SI=F", "XAGUSD"]
-    if sym in known_directs or sym.endswith("=X") or sym.endswith("=F") or sym.startswith("^"):
+    known_directs = ["XAUUSD", "GOLD", "GC=F", "EURUSD", "GBPUSD", "OIL", "WTI", "CL=F", "SI=F", "XAGUSD", "BTCUSDT"]
+    if sym in known_directs or sym.endswith("=X") or sym.endswith("=F") or sym.startswith("^") or sym.endswith("USDT"):
         return True
         
     return False
@@ -65,7 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 أهلاً بك في بوت Institutional Code Breaker - ICB\n\n"
         "⚠️ **تنبيه هام:** يجب الانضمام لقناتنا الرسمية أولاً لتفعيل البوت واستخدام أدوات التحليل:\n"
         "https://t.me/ICBVO\n\n"
-        "بعد الانضمام، أرسل اسم أي أداة مالية (مثل: XAUUSD, EURUSD, BTCUSDT) للحصول على:\n"
+        "بعد الانضمام، أرسل اسم أي أداة مالية (مثل: XAUUSD, BTCUSDT) للحصول على:\n"
         "1️⃣ جلب بيانات وحركة السوق الحية على فريم 144 دقيقة\n"
         "2️⃣ تحليل السيولة المؤسسية وإستراتيجية ICB\n"
         "3️⃣ رسم الشارت مع مستويات الدخول، وقف الخسارة، والأهداف"
@@ -125,15 +124,54 @@ async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Detailed Error: {err_details}")
         await update.message.reply_text(f"⚠️ خطأ تقني أثناء المعالجة:\n{str(e)[:200]}")
 
+async def send_hourly_updates(context: ContextTypes.DEFAULT_TYPE):
+    """وظيفة أوتوماتيكية يتم تشغيلها كل ساعة لإرسال تحديثات الذهب والبيتكوين للقناة"""
+    symbols_to_update = ["XAUUSD", "BTCUSDT"]
+    
+    for symbol in symbols_to_update:
+        try:
+            data = fetch_market_data(symbol)
+            if data is not None and not data.empty:
+                analysis = analyze_confluence(data)
+                chart_buf = generate_chart(data, analysis)
+                
+                if chart_buf is not None:
+                    if hasattr(chart_buf, 'seek'):
+                        chart_buf.seek(0)
+                        
+                    caption = (
+                        f"⏰ **تحديث تلقائي كل ساعة - ICB Framework**\n"
+                        f"📊 **الأصل:** {symbol}\n\n"
+                        f"🔹 الاتجاه: {analysis.get('bias', 'N/A')}\n"
+                        f"🎯 منطقة الدخول: {analysis.get('entry', 'N/A')}\n"
+                        f"🛑 وقف الخسارة: {analysis.get('sl', 'N/A')}\n"
+                        f"🎯 الأهداف: {analysis.get('tp', 'N/A')}"
+                    )
+                    await context.bot.send_photo(chat_id=CHANNEL_USERNAME, photo=chart_buf, caption=caption, parse_mode='Markdown')
+        except Exception as e:
+            logging.error(f"Error in hourly update for {symbol}: {e}")
+
+async def post_init(application):
+    """تعيين أوامر البوت وجدولة التحديثات التلقائية كل ساعة (3600 ثانية)"""
+    commands = [
+        ("start", "بدء تشغيل بوت ICB وعرض التعليمات"),
+    ]
+    await application.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in commands])
+    
+    # جدولة المهمة التلقائية (كل 3600 ثانية = ساعة) مع تأخير 10 ثوانٍ لبدء التشغيل
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(send_hourly_updates, interval=3600, first=10)
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN environment variable is missing!")
         return
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_analysis))
-    print("Bot is running with full ICB Integration...")
+    print("Bot is running with automated hourly updates & ICB Integration...")
     app.run_polling()
 
 if __name__ == '__main__':
