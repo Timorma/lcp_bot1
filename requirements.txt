@@ -1,6 +1,6 @@
-python-telegram-bot>=20.0
+pyTelegramBotAPI
+python-telegram-bot
 yfinance
-matplotlib
 pandas
-
-
+matplotlib
+pypdf
