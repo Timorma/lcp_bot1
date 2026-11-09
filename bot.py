@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import traceback
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from fetcher import fetch_market_data
@@ -15,7 +14,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_USERNAME = "@ICBVO"
 
-# إعداد عقل الذكاء الاصطناعي الحر (Groq Client)
+# تفعيل عقل الذكاء الاصطناعي عبر Groq
 ai_client = None
 if GROQ_API_KEY:
     ai_client = OpenAI(
@@ -61,32 +60,39 @@ def is_symbol_supported(symbol: str) -> bool:
     return False
 
 def consult_ai_brain(user_query: str) -> str:
-    """عقل ثماني النواه ومحلل مالي مؤسسي عبر Groq"""
+    """استدعاء العقل السيبراني الحقيقي من Groq"""
     if not ai_client:
-        return "🧠 عقل الـ AI غير متصل حالياً (يرجى التأكد من إضافة GROQ_API_KEY في Railway)."
+        return "🧠 عقل الـ AI غير متصل حالياً (تأكد من GROQ_API_KEY)."
     
     system_prompt = (
-        "أنت المحلل المالي المؤسسي وموجه مدرسة Institutional Code Breaker (ICB). "
-        "تتكلم بثقة تامة، تفهم تحليل السيولة، صانع السوق، وفريم 144 دقيقة. أجب على الأسئلة المالية وتحليل الأسواق باحترافية وعمق باللغة العربية."
+        "أنت العقل التوجيهي والمحلل الرئيسي لمدرسة Institutional Code Breaker (ICB).\n"
+        "لست مساعداً آلياً تقليدياً، بل خبير تداول مؤسسي ومحلل أسواق محنك.\n"
+        "تتكلم بثقة، تفهم لغة المتحدث بعمق (سواء كانت فصحى أو عامية تداول)، وتغوص في سيولة صانع السوق، "
+        "فريم 144 دقيقة، وأماكن تمركز عقود المؤسسات (Order Blocks & Liquidity Pools).\n"
+        "أجب باحترافية، وكن محللاً ذكياً يفكر خارج الصندوق."
     )
     
-    try:
-        response = ai_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ],
-            temperature=0.7,
-            max_tokens=800
-        )
-        if response and response.choices:
-            return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Groq AI Detailed Error: {e}")
-        return f"عذراً يا فنان، حدث خطأ تقني في الاتصال بالعقل السيبراني: {str(e)}"
+    # قائمة موديلات Groq المعتمدة للتجربة بالترتيب لضمان التوافق 100%
+    available_models = ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]
     
-    return "مرحباً يا فنان، أنا جاهز لتحليلات الـ ICB والسيولة المؤسسية، تفضل بطرح سؤالك."
+    for model_name in available_models:
+        try:
+            response = ai_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ],
+                temperature=0.7,
+                max_tokens=800
+            )
+            if response and response.choices:
+                return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"Failed with {model_name}: {e}")
+            continue
+            
+    return "عذراً يا فنان، حدث خلل في الربط بالموديل. جرب مرة ثانية."
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
@@ -94,8 +100,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚠️ **تنبيه هام:** اشترك في قناتنا أولاً لتفعيل الطاقة الكاملة للبوت:\n"
         "https://t.me/ICBVO\n\n"
         "🤖 **طريقة التعامل:**\n"
-        "1️⃣ اكتب أي رمز أصل مالي (مثل `XAUUSD`, `BTCUSDT`) لسحب الشارت وتحليله فريماً بفريم.\n"
-        "2️⃣ ناقشني في أي استراتيجية، سيولة، أو تحليل وسأرد عليك كمحلل مؤسسي محترف يقرأ ما بين السطور!"
+        "1️⃣ اكتب أي رمز أصل مالي (مثل `XAUUSD`, `BTCUSDT`) لسحب الشارت وتحليله.\n"
+        "2️⃣ ناقشني في أي استراتيجية أو سيولة وسأرد عليك كمحلل مؤسسي محترف!"
     )
     await update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
@@ -184,7 +190,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Cyber-Bot with Llama-3 AI is running...")
+    print("Cyber-Bot with Groq AI is running...")
     app.run_polling()
 
 if __name__ == '__main__':
