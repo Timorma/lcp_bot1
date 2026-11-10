@@ -1,12 +1,18 @@
 
 import os
 import time
+import json
 import logging
+import threading
+from urllib.parse import urlencode
+from datetime import datetime, timezone
+from threading import Lock
+
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from threading import Lock
+import websocket
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +99,10 @@ YAHOO_SYMBOLS = {
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TWELVE_URL = "https://api.twelvedata.com/time_series"
 
+TWELVE_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
+
 REQUEST_TIMEOUT = 20
-MAX_RETRIES = 3
+MAX_RETRIES = 2
 DEFAULT_LIMIT = 1000
 
 TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
@@ -108,6 +116,22 @@ CACHE_SECONDS = {
 "4h":180,"6h":240,"8h":300,"12h":300,
 "1d":600,"3d":900,"1w":1200,"1mo":1800,
 "45d":1800,"90d":1800,"144d":1800
+}
+
+_LIVE_LOCK = Lock()
+_LIVE_STOP = threading.Event()
+_LIVE_APP = None
+_LIVE_THREAD = None
+_LIVE_HEARTBEAT = None
+
+_LIVE_DATA = {
+"symbol":None,
+"price":None,
+"timestamp":None,
+"received_at":None,
+"provider":"twelve",
+"status":"disconnected",
+"error":None
 }
 
 def _safe_number(value):
@@ -147,10 +171,21 @@ def _normalize_dataframe(data):
     frame = data.copy()
 
     if isinstance(frame.columns,pd.MultiIndex):
-        frame.columns = [
-            str(column[0]).lower().strip()
-            for column in frame.columns
-        ]
+        selected_columns = []
+        for column in frame.columns:
+            parts = [str(x).lower().strip() for x in column]
+            selected = next(
+                (
+                    part for part in parts
+                    if part in [
+                        "open","high","low","close",
+                        "adj close","volume"
+                    ]
+                ),
+                parts[-1]
+            )
+            selected_columns.append(selected)
+        frame.columns = selected_columns
     else:
         frame.columns = [
             str(column).lower().strip()
@@ -166,6 +201,9 @@ def _normalize_dataframe(data):
     }
 
     frame = frame.rename(columns=aliases)
+
+    if frame.columns.duplicated().any():
+        frame = frame.loc[:,~frame.columns.duplicated(keep="first")]
 
     required = ["open","high","low","close"]
 
@@ -198,7 +236,7 @@ def _normalize_dataframe(data):
                 column for column in ["time","date","datetime"]
                 if column in frame.columns
             ),
-           None
+            None
         )
 
         if time_column:
@@ -230,10 +268,8 @@ def _normalize_dataframe(data):
 
 def _validate_data(data,min_rows=30):
     frame = _normalize_dataframe(data)
-
     if len(frame) < min_rows:
         return None
-
     return frame
 
 def _request_json(url,params=None):
@@ -269,7 +305,8 @@ def _request_json(url,params=None):
                 "Request attempt %s failed: %s",
                 attempt+1,error
             )
-            time.sleep(0.5*(attempt+1))
+            if attempt < MAX_RETRIES-1:
+                time.sleep(0.5*(attempt+1))
 
     raise RuntimeError(str(last_error))
 
@@ -352,7 +389,11 @@ def _fetch_yahoo(symbol,interval,period=None):
     provider_symbol = YAHOO_SYMBOLS.get(symbol,symbol)
 
     if period is None:
-        period = "60d" if interval in ["1m","2m","5m","15m","30m","1h"] else "2y"
+        period = (
+            "60d"
+            if interval in ["1m","2m","5m","15m","30m","1h"]
+            else "2y"
+        )
 
     ticker = yf.Ticker(provider_symbol)
 
@@ -407,10 +448,7 @@ def _source_candidates(symbol,timeframe):
     if crypto:
         return ["binance","twelve"]
 
-    if symbol == "XAUUSD":
-        return ["twelve","yahoo_futures_proxy"]
-
-    if symbol == "XAGUSD":
+    if symbol in ["XAUUSD","XAGUSD"]:
         return ["twelve","yahoo_futures_proxy"]
 
     return ["twelve","yahoo"]
@@ -427,10 +465,8 @@ def _fetch_source(symbol,timeframe,source):
 
     if source == "yahoo_futures_proxy":
         proxy_symbol = YAHOO_SYMBOLS.get(symbol)
-
         if not proxy_symbol:
             return None
-
         return _fetch_yahoo(proxy_symbol,timeframe)
 
     return None
@@ -479,7 +515,6 @@ def _custom_rule(timeframe):
         "90d":"90D",
         "144d":"144D"
     }
-
     return rules.get(timeframe)
 
 def _fetch_daily_for_custom(symbol):
@@ -487,10 +522,7 @@ def _fetch_daily_for_custom(symbol):
 
     for source in _source_candidates(symbol,"1d"):
         try:
-            if source == "yahoo_futures_proxy":
-                data = _fetch_source(symbol,"1d",source)
-            else:
-                data = _fetch_source(symbol,"1d",source)
+            data = _fetch_source(symbol,"1d",source)
 
             if data is not None and len(data) >= 30:
                 return data,source,None
@@ -511,7 +543,8 @@ def fetch_timeframe_info(symbol,timeframe,force_refresh=False):
             "data":None,
             "provider":None,
             "error":"Unsupported timeframe",
-            "elapsed_seconds":0
+            "elapsed_seconds":0,
+            "cached":False
         }
 
     cached = None if force_refresh else _get_cached(
@@ -601,7 +634,6 @@ def fetch_timeframe_info(symbol,timeframe,force_refresh=False):
                 "Provider %s failed for %s %s: %s",
                 source,normalized,timeframe,error
             )
-
             errors.append(f"{source}: {str(error)}")
 
     return {
@@ -618,7 +650,6 @@ def fetch_timeframe(symbol,timeframe,force_refresh=False):
         timeframe,
         force_refresh
     )
-
     return result["data"]
 
 def fetch_market_bundle(symbol,timeframes=None,force_refresh=False):
@@ -697,3 +728,219 @@ def get_cache_status():
             }
             for key,value in _CACHE.items()
         }
+
+# ==========================================
+# ICB LIVE PRICE ENGINE
+# ==========================================
+
+def _live_set_status(status,error=None):
+    with _LIVE_LOCK:
+        _LIVE_DATA["status"] = status
+        _LIVE_DATA["error"] = error
+
+def _live_on_open(ws):
+    logger.info("ICB live websocket connected")
+    _live_set_status("connected")
+
+    subscription = {
+        "action":"subscribe",
+        "params":{
+            "symbols":"XAU/USD"
+        }
+    }
+
+    ws.send(json.dumps(subscription))
+
+    def heartbeat():
+        while not _LIVE_STOP.wait(10):
+            try:
+                if ws.sock and ws.sock.connected:
+                    ws.send(json.dumps({
+                        "action":"heartbeat"
+                    }))
+                else:
+                    break
+            except Exception as error:
+                logger.warning("Heartbeat failed: %s",error)
+                break
+
+    global _LIVE_HEARTBEAT
+
+    _LIVE_HEARTBEAT = threading.Thread(
+        target=heartbeat,
+        daemon=True
+    )
+    _LIVE_HEARTBEAT.start()
+
+def _live_on_message(ws,message):
+    try:
+        payload = json.loads(message)
+
+        event = payload.get("event")
+
+        if event == "price":
+            symbol = payload.get("symbol")
+            price = _safe_number(payload.get("price"))
+
+            if price is None or price <= 0:
+                return
+
+            if symbol and symbol.upper() not in [
+                "XAU/USD","XAUUSD"
+            ]:
+                return
+
+            timestamp = payload.get("timestamp")
+
+            market_time = None
+
+            if timestamp is not None:
+                market_time = datetime.fromtimestamp(
+                    float(timestamp),
+                    tz=timezone.utc
+                ).isoformat()
+
+            received_time = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            with _LIVE_LOCK:
+                _LIVE_DATA.update({
+                    "symbol":"XAU/USD",
+                    "price":price,
+                    "timestamp":market_time,
+                    "received_at":received_time,
+                    "provider":"twelve",
+                    "status":"live",
+                    "error":None
+                })
+
+        elif event == "subscribe-status":
+            if payload.get("fails"):
+                _live_set_status(
+                    "subscription_error",
+                    str(payload.get("fails"))
+                )
+
+            logger.info("Subscription status: %s",payload)
+
+        elif payload.get("status") == "error":
+            _live_set_status(
+                "provider_error",
+                str(payload.get("message",payload))
+            )
+
+    except Exception as error:
+        logger.warning("Live message parsing error: %s",error)
+
+def _live_on_error(ws,error):
+    logger.warning("Live websocket error: %s",error)
+    _live_set_status("error",str(error))
+
+def _live_on_close(ws,code,message):
+    logger.warning(
+        "Live websocket closed: %s %s",
+        code,
+        message
+    )
+
+    if not _LIVE_STOP.is_set():
+        _live_set_status("disconnected")
+
+def _live_worker():
+    global _LIVE_APP
+
+    while not _LIVE_STOP.is_set():
+        if not TWELVE_API_KEY:
+            _live_set_status(
+                "configuration_error",
+                "TWELVE_DATA_API_KEY is missing"
+            )
+            return
+
+        url = TWELVE_WS_URL + "?" + urlencode({
+            "apikey":TWELVE_API_KEY
+        })
+
+        try:
+            _LIVE_APP = websocket.WebSocketApp(
+                url,
+                on_open=_live_on_open,
+                on_message=_live_on_message,
+                on_error=_live_on_error,
+                on_close=_live_on_close
+            )
+
+            _LIVE_APP.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+        except Exception as error:
+            logger.exception("Live websocket worker failed")
+            _live_set_status("error",str(error))
+
+        if not _LIVE_STOP.is_set():
+            _live_set_status("reconnecting")
+            _LIVE_STOP.wait(5)
+
+def start_live_price():
+    global _LIVE_THREAD
+
+    if not TWELVE_API_KEY:
+        _live_set_status(
+            "configuration_error",
+            "TWELVE_DATA_API_KEY is missing"
+        )
+        return False
+
+    if _LIVE_THREAD and _LIVE_THREAD.is_alive():
+        return True
+
+    _LIVE_STOP.clear()
+
+    _LIVE_THREAD = threading.Thread(
+        target=_live_worker,
+        daemon=True
+    )
+
+    _LIVE_THREAD.start()
+    return True
+
+def stop_live_price():
+    _LIVE_STOP.set()
+
+    if _LIVE_APP:
+        try:
+            _LIVE_APP.close()
+        except Exception:
+            pass
+
+    _live_set_status("stopped")
+
+def get_live_price():
+    with _LIVE_LOCK:
+        result = dict(_LIVE_DATA)
+
+    received = result.get("received_at")
+
+    if received:
+        received_dt = datetime.fromisoformat(received)
+        age = (
+            datetime.now(timezone.utc)-received_dt
+        ).total_seconds()
+    else:
+        age = None
+
+    result["age_seconds"] = (
+        round(age,2) if age is not None else None
+    )
+
+    result["is_fresh"] = (
+        age is not None and age <= 15
+    )
+
+    if age is not None and age > 15:
+        result["status"] = "stale"
+
+    return result
