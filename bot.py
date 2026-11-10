@@ -1,652 +1,731 @@
 
+import os
+import json
 import logging
-import numpy as np
-import pandas as pd
-from fetcher import TIMEFRAMES
+import asyncio
+from pathlib import Path
+from datetime import time
+from zoneinfo import ZoneInfo
+from html import escape
 
-logger = logging.getLogger(__name__)
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-TIMEFRAME_WEIGHTS = {
-"1m":0.5,
-"3m":0.6,
-"5m":0.7,
-"15m":0.8,
-"30m":0.9,
-"45m":1.0,
-"1h":1.1,
-"2h":1.2,
-"4h":1.4,
-"6h":1.5,
-"8h":1.6,
-"12h":1.7,
-"1d":2.0,
-"3d":2.3,
-"1w":2.7,
-"1mo":3.0,
-"45d":3.2,
-"90d":3.5,
-"144d":4.0
-}
-
-TIMEFRAME_GROUPS = {
-"الرئيسي":["144d","90d","45d","1mo","1w","3d","1d"],
-"المتوسط":["12h","8h","6h","4h","2h","1h"],
-"القصير":["45m","30m","15m","5m","3m","1m"]
-}
-
-GROUP_WEIGHTS = {
-"الرئيسي":0.55,
-"المتوسط":0.30,
-"القصير":0.15
-}
-
-DIRECTION_THRESHOLD = 0.18
+from fetcher import fetch_market_bundle
+from analyzer import analyze_multitimeframe
+from chart_drawer import generate_timeframe_chart
 
 
-def _empty_result():
-    return {
-        "bias":"غير محدد",
-        "confidence":0.0,
-        "last_close":None,
-        "atr":None,
-        "volatility_pct":None,
-        "structure":"بيانات غير كافية",
-        "support":[],
-        "resistance":[],
-        "evidence":[],
-        "warnings":["لا توجد بيانات كافية"]
-    }
+# ==============================
+# ICB BOT CONFIGURATION
+# ==============================
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHANNEL_USERNAME = "@ICBVO"
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+
+BASE_DIR = Path(__file__).resolve().parent
+SYMBOLS_DIR = BASE_DIR / "symbols"
+
+DAILY_REPORT_TIME = time(hour=3, minute=0, tzinfo=CAIRO_TZ)
+
+DAILY_SYMBOLS = ["GOLD", "BTCUSDT"]
+
+MAX_REPORT_LENGTH = 3900
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger("ICB_BOT")
 
 
-def _prepare(df):
-    if df is None or len(df)<30:
+# ==============================
+# SYMBOL CONFIGURATION
+# ==============================
+
+def load_json_file(filename):
+    path = SYMBOLS_DIR / filename
+
+    if not path.exists():
+        logger.warning("Symbols file not found: %s", path)
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        logger.exception("Cannot read symbols file: %s", filename)
+        return {}
+
+
+def normalize_symbol(symbol):
+    return str(symbol).strip().upper().replace("/", "").replace(" ", "")
+
+
+def load_symbol_configuration():
+    forex_data = load_json_file("forex.json")
+    crypto_data = load_json_file("crypto.json")
+
+    aliases = forex_data.get("aliases", {})
+    normalized_aliases = {}
+
+    if isinstance(aliases, dict):
+        for name, value in aliases.items():
+            normalized_aliases[normalize_symbol(name)] = str(value).strip()
+
+    crypto_symbols = set()
+
+    def collect_crypto_symbols(data):
+        if isinstance(data, str):
+            value = normalize_symbol(data)
+            if value:
+                crypto_symbols.add(value)
+
+        elif isinstance(data, list):
+            for item in data:
+                collect_crypto_symbols(item)
+
+        elif isinstance(data, dict):
+            for key, value in data.items():
+                if key in ("provider", "category", "market_types", "quote_asset"):
+                    continue
+
+                if key == "symbols":
+                    collect_crypto_symbols(value)
+                elif isinstance(value, (dict, list)):
+                    collect_crypto_symbols(value)
+                elif isinstance(value, str):
+                    collect_crypto_symbols(value)
+
+    collect_crypto_symbols(crypto_data)
+
+    return normalized_aliases, crypto_symbols
+
+
+SYMBOL_ALIASES, CRYPTO_SYMBOLS = load_symbol_configuration()
+
+
+def resolve_symbol(user_symbol):
+    original = normalize_symbol(user_symbol)
+
+    if not original:
         return None
 
-    required=["Open","High","Low","Close"]
+    if original in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[original]
 
-    if not all(c in df.columns for c in required):
+    if original in CRYPTO_SYMBOLS:
+        return original
+
+    if original.endswith("USDT"):
+        return original
+
+    return None
+
+
+def refresh_symbols():
+    global SYMBOL_ALIASES, CRYPTO_SYMBOLS
+    SYMBOL_ALIASES, CRYPTO_SYMBOLS = load_symbol_configuration()
+
+
+# ==============================
+# SUBSCRIPTION CHECK
+# ==============================
+
+async def is_subscribed(user_id, context):
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=CHANNEL_USERNAME,
+            user_id=user_id
+        )
+
+        return member.status in ("creator", "administrator", "member")
+
+    except Exception:
+        logger.exception("Subscription verification failed")
         return None
 
-    data=df.copy()
 
-    for col in required:
-        data[col]=pd.to_numeric(data[col],errors="coerce")
-
-    data=data.dropna(subset=required).sort_index()
-
-    data=data[
-        (data["High"]>=data["Low"]) &
-        (data["Close"]>0) &
-        (data["Open"]>0)
-    ]
-
-    if len(data)<30:
-        return None
-
-    return data
-
-
-def _single_timeframe(df,timeframe):
-    data=_prepare(df)
-
-    if data is None:
-        return None
-
-    o=data["Open"]
-    h=data["High"]
-    l=data["Low"]
-    c=data["Close"]
-
-    last=float(c.iloc[-1])
-    prev=c.shift(1)
-
-    tr=pd.concat([
-        h-l,
-        (h-prev).abs(),
-        (l-prev).abs()
-    ],axis=1).max(axis=1)
-
-    atr_value=tr.rolling(14).mean().iloc[-1]
-
-    if not np.isfinite(atr_value) or atr_value<=0:
-        return None
-
-    atr=float(atr_value)
-
-    points_up=0.0
-    points_down=0.0
-    evidence=[]
-
-    ema20=c.ewm(span=20,adjust=False).mean()
-    ema50=c.ewm(span=50,adjust=False).mean()
-
-    fast=float(ema20.iloc[-1])
-    slow=float(ema50.iloc[-1])
-
-    if fast>slow:
-        points_up+=2
-        evidence.append("EMA20 أعلى EMA50")
-
-    elif fast<slow:
-        points_down+=2
-        evidence.append("EMA20 أسفل EMA50")
-
-    if last>fast:
-        points_up+=1
-        evidence.append("الإغلاق أعلى EMA20")
-
-    elif last<fast:
-        points_down+=1
-        evidence.append("الإغلاق أسفل EMA20")
-
-    if len(data)>=200:
-        ema200=c.ewm(span=200,adjust=False).mean()
-        long_value=float(ema200.iloc[-1])
-
-        if last>long_value:
-            points_up+=1.5
-            evidence.append("الإغلاق أعلى EMA200")
-
-        elif last<long_value:
-            points_down+=1.5
-            evidence.append("الإغلاق أسفل EMA200")
-    else:
-        evidence.append("EMA200 مستبعد لعدم كفاية التاريخ")
-
-    prior_high=float(h.iloc[-21:-1].max())
-    prior_low=float(l.iloc[-21:-1].min())
-
-    if last>prior_high:
-        points_up+=2
-        evidence.append("إغلاق أعلى قمة آخر 20 شمعة")
-
-    elif last<prior_low:
-        points_down+=2
-        evidence.append("إغلاق أسفل قاع آخر 20 شمعة")
-
-    candle_range=max(float(h.iloc[-1]-l.iloc[-1]),1e-12)
-
-    upper_wick=float(
-        h.iloc[-1]-max(o.iloc[-1],c.iloc[-1])
-    )/candle_range
-
-    lower_wick=float(
-        min(o.iloc[-1],c.iloc[-1])-l.iloc[-1]
-    )/candle_range
-
-    if lower_wick>=0.45 and c.iloc[-1]>o.iloc[-1]:
-        points_up+=0.75
-        evidence.append("رفض سعري بفتيل سفلي")
-
-    if upper_wick>=0.45 and c.iloc[-1]<o.iloc[-1]:
-        points_down+=0.75
-        evidence.append("رفض سعري بفتيل علوي")
-
-    total=points_up+points_down
-
-    if points_up>points_down:
-        bias="صاعد"
-
-    elif points_down>points_up:
-        bias="هابط"
-
-    else:
-        bias="محايد"
-
-    signed_strength=(
-        (points_up-points_down)/max(total,1.0)
+async def subscription_message(update):
+    await update.effective_message.reply_text(
+        "لاستخدام بوت ICB يجب الاشتراك في القناة أولاً:\n\n"
+        "https://t.me/ICBVO\n\n"
+        "بعد الاشتراك أرسل /start مرة أخرى."
     )
 
-    confidence=abs(signed_strength)*100
 
-    volatility=atr/last*100
+# ==============================
+# ACCESS CONTROL
+# ==============================
 
-    window=min(160,len(data))
-    recent=data.iloc[-window:]
+async def check_access(update, context):
+    if not update.effective_user or not update.effective_message:
+        return False
 
-    lows=recent["Low"]
-    highs=recent["High"]
-
-    pivot_lows=[]
-    pivot_highs=[]
-
-    for i in range(2,len(recent)-2):
-        low_value=float(lows.iloc[i])
-        high_value=float(highs.iloc[i])
-
-        if (
-            low_value<=float(lows.iloc[i-1])
-            and low_value<=float(lows.iloc[i-2])
-            and low_value<float(lows.iloc[i+1])
-            and low_value<float(lows.iloc[i+2])
-        ):
-            pivot_lows.append(low_value)
-
-        if (
-            high_value>=float(highs.iloc[i-1])
-            and high_value>=float(highs.iloc[i-2])
-            and high_value>float(highs.iloc[i+1])
-            and high_value>float(highs.iloc[i+2])
-        ):
-            pivot_highs.append(high_value)
-
-    return {
-        "timeframe":timeframe,
-        "bias":bias,
-        "confidence":round(float(confidence),1),
-        "signed_strength":round(float(signed_strength),4),
-        "last_close":last,
-        "atr":atr,
-        "volatility_pct":volatility,
-        "structure":"قمم وقيعان مع اتجاه المتوسطات",
-        "evidence":evidence,
-        "bullish_points":points_up,
-        "bearish_points":points_down,
-        "support_candidates":pivot_lows[-25:],
-        "resistance_candidates":pivot_highs[-25:],
-        "last_time":data.index[-1].isoformat()
-    }
-
-
-def _cluster_levels(levels,tolerance):
-    if not levels:
-        return []
-
-    values=sorted(
-        float(x)
-        for x in levels
-        if np.isfinite(float(x)) and float(x)>0
+    result = await is_subscribed(
+        update.effective_user.id,
+        context
     )
 
-    if not values:
-        return []
+    if result is True:
+        return True
 
-    clusters=[]
-    current=[values[0]]
+    if result is False:
+        await subscription_message(update)
+        return False
 
-    for value in values[1:]:
-        center=float(np.mean(current))
+    await update.effective_message.reply_text(
+        "تعذر التحقق من الاشتراك حالياً.\n"
+        "حاول مرة أخرى بعد قليل."
+    )
 
-        if abs(value-center)<=tolerance:
-            current.append(value)
-        else:
-            clusters.append(current)
-            current=[value]
-
-    clusters.append(current)
-
-    return [
-        {
-            "price":round(float(np.mean(group)),8),
-            "touches":len(group)
-        }
-        for group in clusters
-    ]
+    return False
 
 
-def _calculate_group(group_name,per_frame):
-    frames=TIMEFRAME_GROUPS[group_name]
+# ==============================
+# REPORT HELPERS
+# ==============================
 
-    score=0.0
-    total_weight=0.0
-    bullish=[]
-    bearish=[]
-    neutral=[]
-    used=[]
+def safe_value(value, default="غير متاح"):
+    if value is None:
+        return default
 
-    for timeframe in frames:
-        result=per_frame.get(timeframe)
+    try:
+        if isinstance(value, float) and value != value:
+            return default
+    except Exception:
+        pass
 
-        if result is None:
-            continue
+    return str(value)
 
-        weight=TIMEFRAME_WEIGHTS.get(timeframe,1.0)
 
-        score+=result["signed_strength"]*weight
-        total_weight+=weight
-        used.append(timeframe)
+def format_number(value):
+    try:
+        number = float(value)
 
-        if result["bias"]=="صاعد":
-            bullish.append(timeframe)
+        if abs(number) >= 1000:
+            return f"{number:,.2f}"
 
-        elif result["bias"]=="هابط":
-            bearish.append(timeframe)
+        return f"{number:.5f}".rstrip("0").rstrip(".")
+
+    except Exception:
+        return safe_value(value)
+
+
+def format_levels(levels, limit=5):
+    if not isinstance(levels, list) or not levels:
+        return "لا توجد مستويات كافية"
+
+    lines = []
+
+    for item in levels[:limit]:
+        if isinstance(item, dict):
+            price = item.get("price", item.get("level"))
+            strength = item.get("strength", item.get("touches"))
+
+            line = f"• {format_number(price)}"
+
+            if strength is not None:
+                line += f" | القوة: {safe_value(strength)}"
+
+            lines.append(line)
 
         else:
-            neutral.append(timeframe)
+            lines.append(f"• {format_number(item)}")
 
-    normalized=score/max(total_weight,1e-12)
-
-    if total_weight==0:
-        direction="غير متاح"
-        agreement=0.0
-    elif normalized>=DIRECTION_THRESHOLD:
-        direction="صاعد"
-        agreement=normalized*100
-    elif normalized<=-DIRECTION_THRESHOLD:
-        direction="هابط"
-        agreement=abs(normalized)*100
-    else:
-        direction="متوازن"
-        agreement=abs(normalized)*100
-
-    return {
-        "name":group_name,
-        "direction":direction,
-        "score":round(float(normalized),4),
-        "agreement":round(float(agreement),1),
-        "available":len(used),
-        "requested":len(frames),
-        "bullish":bullish,
-        "bearish":bearish,
-        "neutral":neutral,
-        "timeframes":used
-    }
+    return "\n".join(lines)
 
 
-def _classify_consensus(groups):
-    main=groups["الرئيسي"]
-    medium=groups["المتوسط"]
-    short=groups["القصير"]
+def format_group(group):
+    if not isinstance(group, dict):
+        return "غير متاح"
 
-    available=[
-        (name,group,GROUP_WEIGHTS[name])
-        for name,group in groups.items()
-        if group["direction"]!="غير متاح"
+    direction = safe_value(
+        group.get("direction", group.get("bias"))
+    )
+
+    agreement = group.get("agreement")
+
+    result = f"الاتجاه الوصفي: {direction}"
+
+    if agreement is not None:
+        result += f"\nالتوافق: {safe_value(agreement)}"
+
+    return result
+
+
+def build_report(symbol, analysis):
+    if not isinstance(analysis, dict):
+        return "تعذر تكوين التقرير."
+
+    summary = analysis.get("summary", {})
+
+    if not isinstance(summary, dict):
+        summary = {}
+
+    price = format_number(
+        summary.get("current_price_reference")
+    )
+
+    bias = safe_value(summary.get("bias"))
+    confidence = summary.get("confidence")
+
+    consensus = safe_value(
+        summary.get("consensus_state")
+    )
+
+    main_direction = safe_value(
+        summary.get("main_direction")
+    )
+
+    medium_direction = safe_value(
+        summary.get("medium_direction")
+    )
+
+    short_direction = safe_value(
+        summary.get("short_direction")
+    )
+
+    groups = summary.get("groups", {})
+
+    if not isinstance(groups, dict):
+        groups = {}
+
+    report = [
+        "📊 <b>ICB | MARKET RESEARCH</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"الأداة: <b>{escape(symbol)}</b>",
+        f"السعر المرجعي: <b>{escape(price)}</b>",
+        "",
+        "🧠 <b>قراءة الهيكل العام</b>",
+        f"الميل الوصفي: {escape(bias)}",
+        f"حالة التوافق: {escape(consensus)}",
+        ""
     ]
 
-    if not available:
-        return "غير محدد",0.0,"غير متاح"
+    if confidence is not None:
+        report.append(
+            f"قوة النموذج النسبية: {escape(safe_value(confidence))}"
+        )
+        report.append(
+            "<i>هذه درجة تقييم داخلية وليست احتمالاً مضموناً.</i>"
+        )
+        report.append("")
 
-    weighted_score=sum(
-        group["score"]*weight
-        for name,group,weight in available
-    )/sum(
-        weight
-        for name,group,weight in available
+    report.extend([
+        "📌 <b>تحليل المجموعات الزمنية</b>",
+        "",
+        "🔵 <b>الرئيسي</b>",
+        escape(format_group(groups.get("main", {}))),
+        f"الاتجاه: {escape(main_direction)}",
+        "",
+        "🟡 <b>المتوسط</b>",
+        escape(format_group(groups.get("medium", {}))),
+        f"الاتجاه: {escape(medium_direction)}",
+        "",
+        "🟢 <b>القصير</b>",
+        escape(format_group(groups.get("short", {}))),
+        f"الاتجاه: {escape(short_direction)}",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "🧱 <b>مناطق الدعم</b>",
+        escape(format_levels(summary.get("support", []))),
+        "",
+        "🧱 <b>مناطق المقاومة</b>",
+        escape(format_levels(summary.get("resistance", []))),
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "<i>التقرير للدراسة وفهم بنية السوق فقط، "
+        "ولا يمثل توصية شراء أو بيع.</i>",
+        "",
+        "<b>ICB | Institutional Code Breaker</b>"
+    ])
+
+    text = "\n".join(report)
+
+    if len(text) > MAX_REPORT_LENGTH:
+        text = text[:MAX_REPORT_LENGTH - 30] + "\n\n<i>تم اختصار التقرير.</i>"
+
+    return text
+
+
+# ==============================
+# MARKET ANALYSIS ENGINE
+# ==============================
+
+async def run_analysis(symbol):
+    logger.info("Starting analysis for %s", symbol)
+
+    bundle = await asyncio.to_thread(
+        fetch_market_bundle,
+        symbol
     )
 
-    if main["direction"]=="غير متاح":
-        if weighted_score>=DIRECTION_THRESHOLD:
-            return "ميل صاعد غير مؤكد",abs(weighted_score)*100,"الرئيسي غير متاح"
-        if weighted_score<=-DIRECTION_THRESHOLD:
-            return "ميل هابط غير مؤكد",abs(weighted_score)*100,"الرئيسي غير متاح"
-        return "توازن / تعارض",abs(weighted_score)*100,"الرئيسي غير متاح"
+    if not bundle:
+        raise ValueError("مصدر البيانات لم يرجع بيانات.")
 
-    if main["direction"]=="متوازن":
-        return "الرئيسي متوازن",abs(weighted_score)*100,"لا يوجد اتجاه رئيسي واضح"
-
-    main_direction=main["direction"]
-    main_sign=1 if main_direction=="صاعد" else -1
-
-    medium_aligned=(
-        medium["direction"]==main_direction
+    analysis = await asyncio.to_thread(
+        analyze_multitimeframe,
+        bundle
     )
 
-    medium_opposed=(
-        medium["direction"] in ["صاعد","هابط"]
-        and not medium_aligned
+    if not analysis:
+        raise ValueError("تعذر تحليل البيانات.")
+
+    return bundle, analysis
+
+
+# ==============================
+# SEND ANALYSIS
+# ==============================
+
+async def send_analysis(update, context, user_symbol):
+    message = update.effective_message
+
+    resolved = resolve_symbol(user_symbol)
+
+    if not resolved:
+        await message.reply_text(
+            "الرمز غير موجود في ملفات الرموز الحالية.\n\n"
+            "راجع symbols/forex.json أو symbols/crypto.json."
+        )
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=message.chat_id,
+        action=ChatAction.TYPING
     )
 
-    short_aligned=(
-        short["direction"]==main_direction
+    status_message = await message.reply_text(
+        f"⏳ جاري جمع بيانات {user_symbol} وتحليل الأطر الزمنية..."
     )
 
-    short_opposed=(
-        short["direction"] in ["صاعد","هابط"]
-        and not short_aligned
-    )
+    try:
+        bundle, analysis = await run_analysis(resolved)
 
-    if medium_opposed:
-        label="الرئيسي "+main_direction+" مع تعارض متوسط"
-        state="تعارض متوسط"
+        report = build_report(user_symbol, analysis)
 
-    elif medium_aligned and short_opposed:
-        label="الرئيسي "+main_direction+" مع تصحيح قصير محتمل"
-        state="توافق رئيسي ومتوسط"
-
-    elif medium_aligned and short_aligned:
-        label="توافق صاعد قوي" if main_sign>0 else "توافق هابط قوي"
-        state="توافق الطبقات الثلاث"
-
-    elif medium_aligned:
-        label="توافق رئيسي ومتوسط"
-        state="توافق رئيسي ومتوسط"
-
-    else:
-        label="الرئيسي "+main_direction+" دون تأكيد متوسط"
-        state="تأكيد متوسط غائب"
-
-    return label,abs(weighted_score)*100,state
-
-
-def _build_levels(pool,current_price,tolerance,side):
-    valid=[]
-
-    for price,weight,timeframe in pool:
-        if side=="support" and price<=current_price:
-            valid.append((price,weight,timeframe))
-
-        elif side=="resistance" and price>=current_price:
-            valid.append((price,weight,timeframe))
-
-    levels=_cluster_levels(
-        [x[0] for x in valid],
-        tolerance
-    )
-
-    for level in levels:
-        related=[
-            (weight,timeframe)
-            for price,weight,timeframe in valid
-            if abs(price-level["price"])<=tolerance
-        ]
-
-        level["timeframes"]=sorted(
-            set(tf for weight,tf in related)
+        await status_message.edit_text(
+            report,
+            parse_mode="HTML"
         )
 
-        level["strength"]=round(
-            sum(weight for weight,tf in related),
-            2
-        )
-
-        level["distance_pct"]=round(
-            abs(level["price"]-current_price)/current_price*100,
-            3
-        )
-
-    return sorted(
-        levels,
-        key=lambda x:(x["distance_pct"],-x["strength"])
-    )[:8]
-
-
-def analyze_multitimeframe(bundle):
-    per_frame={}
-    support_pool=[]
-    resistance_pool=[]
-    warnings=[]
-    available=0
-
-    for timeframe in TIMEFRAMES:
-        item=bundle.get(timeframe,{})
-        df=item.get("data")
-
-        if df is None:
-            warnings.append(
-                f"{timeframe}: البيانات غير متاحة "
-                f"({item.get('status','unknown')})"
+        try:
+            chart = await asyncio.to_thread(
+                generate_timeframe_chart,
+                bundle,
+                analysis,
+                user_symbol
             )
-            continue
 
-        result=_single_timeframe(df,timeframe)
+            if chart:
+                if hasattr(chart, "seek"):
+                    chart.seek(0)
 
-        if result is None:
-            warnings.append(
-                f"{timeframe}: البيانات غير كافية للتحليل"
+                await message.reply_photo(
+                    photo=chart,
+                    caption=f"ICB | {user_symbol} | Market Structure"
+                )
+
+        except Exception:
+            logger.exception("Chart generation failed")
+
+    except Exception as error:
+        logger.exception("Analysis failed for %s", user_symbol)
+
+        await status_message.edit_text(
+            "❌ تعذر إكمال التحليل.\n\n"
+            f"التفاصيل: {escape(str(error)[:700])}\n\n"
+            "راجع سجلات Railway لمعرفة مصدر المشكلة.",
+            parse_mode="HTML"
+        )
+
+
+# ==============================
+# START COMMAND
+# ==============================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update, context):
+        return
+
+    await update.effective_message.reply_text(
+        "🌋 <b>مرحباً بك في ICB</b>\n\n"
+        "منصة بحث متعددة الأطر الزمنية.\n\n"
+        "الأوامر المتاحة:\n"
+        "/analyze GOLD - تحليل الذهب\n"
+        "/analyze BTCUSDT - تحليل البيتكوين\n"
+        "/symbols - عرض الرموز المتاحة\n"
+        "/help - المساعدة\n\n"
+        "أو أرسل الرمز مباشرة في رسالة.",
+        parse_mode="HTML"
+    )
+
+
+# ==============================
+# HELP COMMAND
+# ==============================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update, context):
+        return
+
+    await update.effective_message.reply_text(
+        "📘 <b>طريقة استخدام ICB</b>\n\n"
+        "1. أرسل /analyze ثم اسم الأداة.\n"
+        "2. انتظر جمع البيانات من المصادر.\n"
+        "3. سيظهر التقرير متعدد الأطر الزمنية.\n"
+        "4. قد يظهر الرسم البياني إذا توفرت بياناته.\n\n"
+        "أمثلة:\n"
+        "<code>/analyze GOLD</code>\n"
+        "<code>/analyze BTCUSDT</code>\n\n"
+        "التقارير مخصصة للبحث ودراسة حركة السوق.",
+        parse_mode="HTML"
+    )
+
+
+# ==============================
+# SYMBOLS COMMAND
+# ==============================
+
+async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update, context):
+        return
+
+    refresh_symbols()
+
+    forex_names = sorted(SYMBOL_ALIASES.keys())
+    crypto_names = sorted(CRYPTO_SYMBOLS)
+
+    lines = [
+        "📚 <b>رموز ICB المتاحة</b>",
+        "",
+        "🟡 <b>العملات والسلع والمؤشرات</b>"
+    ]
+
+    lines.extend(f"• {escape(item)}" for item in forex_names[:60])
+
+    lines.extend([
+        "",
+        "₿ <b>العملات الرقمية</b>"
+    ])
+
+    lines.extend(f"• {escape(item)}" for item in crypto_names[:60])
+
+    if not forex_names and not crypto_names:
+        lines.append("لم يتم العثور على رموز في ملفات JSON.")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML"
+    )
+
+
+# ==============================
+# ANALYZE COMMAND
+# ==============================
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update, context):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "اكتب الرمز بعد الأمر.\n\n"
+            "مثال:\n"
+            "/analyze GOLD"
+        )
+        return
+
+    symbol = context.args[0]
+    await send_analysis(update, context, symbol)
+
+
+# ==============================
+# DIRECT SYMBOL MESSAGE
+# ==============================
+
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update, context):
+        return
+
+    text_value = update.effective_message.text.strip()
+
+    if not text_value or len(text_value.split()) != 1:
+        return
+
+    if text_value.startswith("/"):
+        return
+
+    refresh_symbols()
+
+    if resolve_symbol(text_value):
+        await send_analysis(update, context, text_value)
+
+
+# ==============================
+# DAILY REPORT
+# ==============================
+
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Starting ICB daily report")
+
+    for symbol in DAILY_SYMBOLS:
+        try:
+            resolved = resolve_symbol(symbol)
+
+            if not resolved:
+                logger.warning("Daily symbol not configured: %s", symbol)
+                continue
+
+            bundle, analysis = await run_analysis(resolved)
+
+            report = build_report(symbol, analysis)
+
+            await context.bot.send_message(
+                chat_id=context.job.chat_id,
+                text=report,
+                parse_mode="HTML"
             )
-            continue
 
-        available+=1
-        per_frame[timeframe]=result
+            chart = await asyncio.to_thread(
+                generate_timeframe_chart,
+                bundle,
+                analysis,
+                symbol
+            )
 
-        weight=TIMEFRAME_WEIGHTS.get(timeframe,1.0)
+            if chart:
+                if hasattr(chart, "seek"):
+                    chart.seek(0)
 
-        support_pool.extend(
-            (x,weight,timeframe)
-            for x in result["support_candidates"]
+                await context.bot.send_photo(
+                    chat_id=context.job.chat_id,
+                    photo=chart,
+                    caption=f"ICB Daily Research | {symbol}"
+                )
+
+        except Exception:
+            logger.exception("Daily report failed for %s", symbol)
+
+
+async def set_daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+
+    if context.job_queue is None:
+        await update.effective_message.reply_text(
+            "ميزة التقارير المجدولة غير مفعلة. "
+            "تأكد من تثبيت python-telegram-bot[job-queue]."
         )
+        return
 
-        resistance_pool.extend(
-            (x,weight,timeframe)
-            for x in result["resistance_candidates"]
-        )
-
-    if available==0:
-        empty=_empty_result()
-        empty["warnings"]=warnings or empty["warnings"]
-
-        return {
-            "summary":empty,
-            "timeframes":{},
-            "warnings":warnings
-        }
-
-    reference=per_frame.get("1d")
-
-    if reference is None:
-        reference=next(iter(per_frame.values()))
-
-    current_price=reference["last_close"]
-
-    daily_atr=reference.get("atr")
-
-    tolerance=max(
-        (daily_atr or current_price*0.002)*0.25,
-        current_price*0.0005
+    existing = context.job_queue.get_jobs_by_name(
+        f"daily_{chat_id}"
     )
 
-    supports=_build_levels(
-        support_pool,
-        current_price,
-        tolerance,
-        "support"
+    for job in existing:
+        job.schedule_removal()
+
+    context.job_queue.run_daily(
+        daily_report,
+        time=DAILY_REPORT_TIME,
+        chat_id=chat_id,
+        name=f"daily_{chat_id}",
+        timezone=CAIRO_TZ
     )
 
-    resistances=_build_levels(
-        resistance_pool,
-        current_price,
-        tolerance,
-        "resistance"
+    await update.effective_message.reply_text(
+        "✅ تم تفعيل التقرير اليومي في هذه المحادثة.\n"
+        "موعد الإرسال: 03:00 صباحاً بتوقيت القاهرة.\n"
+        "الأدوات: الذهب والبيتكوين."
     )
 
-    groups={
-        name:_calculate_group(name,per_frame)
-        for name in TIMEFRAME_GROUPS
-    }
 
-    final_bias,confidence,consensus_state=_classify_consensus(groups)
+# ==============================
+# ERROR HANDLER
+# ==============================
 
-    bullish_frames=[
-        tf for tf,result in per_frame.items()
-        if result["bias"]=="صاعد"
-    ]
-
-    bearish_frames=[
-        tf for tf,result in per_frame.items()
-        if result["bias"]=="هابط"
-    ]
-
-    neutral_frames=[
-        tf for tf,result in per_frame.items()
-        if result["bias"]=="محايد"
-    ]
-
-    conflict=(
-        bool(bullish_frames and bearish_frames)
+async def error_handler(update, context):
+    logger.exception(
+        "Telegram application error",
+        exc_info=context.error
     )
 
-    main_direction=groups["الرئيسي"]["direction"]
-    medium_direction=groups["المتوسط"]["direction"]
-    short_direction=groups["القصير"]["direction"]
 
-    if conflict:
-        warnings.append(
-            "يوجد اختلاف بين بعض الفريمات؛ تم قياسه حسب الطبقات الزمنية."
+# ==============================
+# APPLICATION STARTUP
+# ==============================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing from Railway Variables."
         )
 
-    if groups["الرئيسي"]["available"]<3:
-        warnings.append(
-            "عدد الفريمات الرئيسية المتاحة قليل؛ الثقة في الاتجاه الرئيسي محدودة."
+    logger.info("Loading ICB symbol configuration")
+
+    refresh_symbols()
+
+    logger.info(
+        "Loaded %s aliases and %s crypto symbols",
+        len(SYMBOL_ALIASES),
+        len(CRYPTO_SYMBOLS)
+    )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("symbols", symbols_command)
+    )
+
+    application.add_handler(
+        CommandHandler("analyze", analyze_command)
+    )
+
+    application.add_handler(
+        CommandHandler("daily", set_daily_report_command)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_message_handler
         )
+    )
 
-    if groups["المتوسط"]["available"]<3:
-        warnings.append(
-            "عدد الفريمات المتوسطة المتاحة قليل."
-        )
+    application.add_error_handler(error_handler)
 
-    if groups["القصير"]["available"]<2:
-        warnings.append(
-            "عدد الفريمات القصيرة المتاحة قليل."
-        )
+    logger.info("ICB BOT IS STARTING")
 
-    evidence=[
-        f"الفريمات المتاحة: {available} من {len(TIMEFRAMES)}",
-        f"الصاعدة: {len(bullish_frames)}",
-        f"الهابطة: {len(bearish_frames)}",
-        f"المحايدة: {len(neutral_frames)}",
-        f"الطبقة الرئيسية: {main_direction}",
-        f"الطبقة المتوسطة: {medium_direction}",
-        f"الطبقة القصيرة: {short_direction}",
-        f"حالة التوافق: {consensus_state}"
-    ]
-
-    summary={
-        "bias":final_bias,
-        "confidence":round(confidence,1),
-        "score_type":"قوة الميل المركب وليست احتمال نجاح",
-        "current_price_reference":current_price,
-        "available_timeframes":available,
-        "requested_timeframes":len(TIMEFRAMES),
-        "bullish_timeframes":bullish_frames,
-        "bearish_timeframes":bearish_frames,
-        "neutral_timeframes":neutral_frames,
-        "main_direction":main_direction,
-        "medium_direction":medium_direction,
-        "short_direction":short_direction,
-        "consensus_state":consensus_state,
-        "groups":groups,
-        "conflict":conflict,
-        "support":supports,
-        "resistance":resistances,
-        "evidence":evidence,
-        "warnings":warnings,
-        "structure":"توافق متعدد الطبقات الزمنية"
-    }
-
-    return {
-        "summary":summary,
-        "timeframes":per_frame,
-        "warnings":warnings
-    }
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
-def analyze_confluence(df):
-    result=_single_timeframe(df,"1h")
-
-    if result is None:
-        return _empty_result()
-
-    return {
-        "bias":result["bias"],
-        "entry":None,
-        "sl":None,
-        "tp":None,
-        "confidence":result["confidence"],
-        "volatility":round(result["volatility_pct"],3),
-        "atr":result["atr"],
-        "structure":result["structure"],
-        "evidence":result["evidence"],
-        "warnings":[]
-    }
+if __name__ == "__main__":
+    main()
