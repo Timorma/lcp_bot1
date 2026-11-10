@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 
 CHART_BARS = 100
 CHART_DPI = 130
-FIGURE_SIZE = (15,9)
+FIGURE_SIZE = (15, 9)
 
 TIMEFRAME_PRIORITY = [
 "1d","4h","1h","1w","12h","8h","6h",
-"4h","2h","30m","15m","5m","1mo"
+"2h","30m","15m","5m","1mo"
 ]
 
 def _safe_float(value,default=None):
@@ -64,18 +64,11 @@ def _normalize_frame(data):
             (frame["low"] <= frame["open"]) &
             (frame["low"] <= frame["close"])
         ]
-        if not isinstance(frame.index,pd.DatetimeIndex):
-            frame.index = pd.to_datetime(
-                frame.index,
-                utc=True,
-                errors="coerce"
-            )
-        else:
-            frame.index = pd.to_datetime(
-                frame.index,
-                utc=True,
-                errors="coerce"
-            )
+        frame.index = pd.to_datetime(
+            frame.index,
+            utc=True,
+            errors="coerce"
+        )
         frame = frame.loc[~frame.index.isna()]
         frame = frame.sort_index()
         frame = frame[~frame.index.duplicated(keep="last")]
@@ -267,111 +260,120 @@ def _create_chart(symbol,timeframe,frame,analysis):
     frame = frame.tail(CHART_BARS).copy()
     if frame.empty:
         return None
-    figure = plt.figure(
-        figsize=FIGURE_SIZE,
-        dpi=CHART_DPI,
-        facecolor="#111827"
-    )
-    grid = GridSpec(
-        5,
-        1,
-        figure=figure,
-        hspace=0.08,
-        height_ratios=[4.5,1]
-    )
-    price_axis = figure.add_subplot(grid[:4,0])
-    volume_axis = figure.add_subplot(
-        grid[4,0],
-        sharex=price_axis
-    )
-    for axis in [price_axis,volume_axis]:
-        axis.set_facecolor("#111827")
-        axis.tick_params(colors="#d1d5db",labelsize=8)
-        axis.grid(
-            True,
-            color="#374151",
-            alpha=0.35,
-            linewidth=0.5
+    figure = None
+    output = None
+    try:
+        figure = plt.figure(
+            figsize=FIGURE_SIZE,
+            dpi=CHART_DPI,
+            facecolor="#111827"
         )
-        for spine in axis.spines.values():
-            spine.set_color("#374151")
-    _draw_candles(price_axis,frame)
-    _draw_emas(price_axis,frame)
-    support = _extract_levels(analysis,"support")
-    resistance = _extract_levels(analysis,"resistance")
-    _draw_levels(
-        price_axis,
-        support[:5],
-        "Support",
-        "#32b88a"
-    )
-    _draw_levels(
-        price_axis,
-        resistance[:5],
-        "Resistance",
-        "#e06b6b"
-    )
-    _draw_volume(volume_axis,frame)
-    price_axis.set_title(
-        _chart_title(symbol,timeframe,analysis,frame),
-        color="white",
-        fontsize=11,
-        loc="left",
-        pad=12
-    )
-    price_axis.set_ylabel("Price",color="#d1d5db")
-    price_axis.legend(
-        loc="upper left",
-        fontsize=7,
-        facecolor="#1f2937",
-        edgecolor="#374151",
-        labelcolor="white"
-    )
-    price_axis.ticklabel_format(
-        axis="y",
-        style="plain",
-        useOffset=False
-    )
-    price_axis.yaxis.set_major_formatter(
-        plt.FuncFormatter(
-            lambda value,position:_format_price(value)
+        grid = GridSpec(
+            2,
+            1,
+            figure=figure,
+            hspace=0.08,
+            height_ratios=[4.5,1]
         )
-    )
-    volume_axis.xaxis.set_major_formatter(
-        mdates.DateFormatter("%Y-%m-%d")
-    )
-    volume_axis.xaxis.set_major_locator(
-        mdates.AutoDateLocator(minticks=4,maxticks=8)
-    )
-    plt.setp(
-        price_axis.get_xticklabels(),
-        visible=False
-    )
-    volume_axis.set_xlabel(
-        "Time (UTC)",
-        color="#d1d5db",
-        fontsize=8
-    )
-    figure.text(
-        0.01,
-        0.012,
-        "ICB | Educational Research Chart | Not a trading instruction",
-        color="#9ca3af",
-        fontsize=7
-    )
-    figure.autofmt_xdate()
-    output = io.BytesIO()
-    figure.savefig(
-        output,
-        format="png",
-        dpi=CHART_DPI,
-        bbox_inches="tight",
-        facecolor=figure.get_facecolor()
-    )
-    plt.close(figure)
-    output.seek(0)
-    output.name = f"ICB_{symbol}_{timeframe}.png"
-    return output
+        price_axis = figure.add_subplot(grid[0,0])
+        volume_axis = figure.add_subplot(
+            grid[1,0],
+            sharex=price_axis
+        )
+        for axis in [price_axis,volume_axis]:
+            axis.set_facecolor("#111827")
+            axis.tick_params(colors="#d1d5db",labelsize=8)
+            axis.grid(
+                True,
+                color="#374151",
+                alpha=0.35,
+                linewidth=0.5
+            )
+            for spine in axis.spines.values():
+                spine.set_color("#374151")
+        _draw_candles(price_axis,frame)
+        _draw_emas(price_axis,frame)
+        support = _extract_levels(analysis,"support")
+        resistance = _extract_levels(analysis,"resistance")
+        _draw_levels(
+            price_axis,
+            support[:5],
+            "Support",
+            "#32b88a"
+        )
+        _draw_levels(
+            price_axis,
+            resistance[:5],
+            "Resistance",
+            "#e06b6b"
+        )
+        _draw_volume(volume_axis,frame)
+        price_axis.set_title(
+            _chart_title(symbol,timeframe,analysis,frame),
+            color="white",
+            fontsize=11,
+            loc="left",
+            pad=12
+        )
+        price_axis.set_ylabel("Price",color="#d1d5db")
+        price_axis.legend(
+            loc="upper left",
+            fontsize=7,
+            facecolor="#1f2937",
+            edgecolor="#374151",
+            labelcolor="white"
+        )
+        price_axis.ticklabel_format(
+            axis="y",
+            style="plain",
+            useOffset=False
+        )
+        price_axis.yaxis.set_major_formatter(
+            plt.FuncFormatter(
+                lambda value,position:_format_price(value)
+            )
+        )
+        volume_axis.xaxis.set_major_formatter(
+            mdates.DateFormatter("%Y-%m-%d")
+        )
+        volume_axis.xaxis.set_major_locator(
+            mdates.AutoDateLocator(minticks=4,maxticks=8)
+        )
+        plt.setp(
+            price_axis.get_xticklabels(),
+            visible=False
+        )
+        volume_axis.set_xlabel(
+            "Time (UTC)",
+            color="#d1d5db",
+            fontsize=8
+        )
+        figure.text(
+            0.01,
+            0.012,
+            "ICB | Educational Research Chart | Not a trading instruction",
+            color="#9ca3af",
+            fontsize=7
+        )
+        figure.autofmt_xdate()
+        output = io.BytesIO()
+        figure.savefig(
+            output,
+            format="png",
+            dpi=CHART_DPI,
+            bbox_inches="tight",
+            facecolor=figure.get_facecolor()
+        )
+        output.seek(0)
+        output.name = f"ICB_{symbol}_{timeframe}.png"
+        return output
+    except Exception:
+        if output is not None:
+            output.close()
+        raise
+    finally:
+        if figure is not None:
+            plt.close(figure)
 
 def generate_timeframe_chart(*args,**kwargs):
     try:
