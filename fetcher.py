@@ -30,11 +30,10 @@ BINANCE_INTERVALS = {
 }
 
 TWELVE_INTERVALS = {
-"1m":"1min","3m":"3min","5m":"5min",
-"15m":"15min","30m":"30min","45m":"45min",
-"1h":"1h","2h":"2h","4h":"4h",
-"6h":"6h","8h":"8h","12h":"12h",
-"1d":"1day","1w":"1week","1mo":"1month"
+"1m":"1min","5m":"5min","15m":"15min",
+"30m":"30min","45m":"45min","1h":"1h",
+"2h":"2h","4h":"4h","1d":"1day",
+"1w":"1week","1mo":"1month"
 }
 
 YAHOO_INTERVALS = {
@@ -98,17 +97,26 @@ YAHOO_SYMBOLS = {
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TWELVE_URL = "https://api.twelvedata.com/time_series"
-
 TWELVE_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
 
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 2
-DEFAULT_LIMIT = 1000
+DEFAULT_LIMIT = 500
+TWELVE_OUTPUTSIZE = int(os.getenv("TWELVE_OUTPUTSIZE","500"))
+TWELVE_MIN_INTERVAL = float(os.getenv("TWELVE_MIN_INTERVAL","1.0"))
+TWELVE_COOLDOWN_SECONDS = int(os.getenv("TWELVE_COOLDOWN_SECONDS","60"))
 
 TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 _CACHE = {}
 _CACHE_LOCK = Lock()
+
+_TWELVE_LOCK = Lock()
+_TWELVE_LAST_REQUEST = 0.0
+_TWELVE_COOLDOWN_UNTIL = 0.0
+
+_ERROR_LOCK = Lock()
+_LAST_ERRORS = {}
 
 CACHE_SECONDS = {
 "1m":15,"3m":20,"5m":30,"15m":45,
@@ -133,6 +141,11 @@ _LIVE_DATA = {
 "status":"disconnected",
 "error":None
 }
+
+class ProviderError(Exception):
+    def __init__(self,message,status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
 
 def _safe_number(value):
     try:
@@ -272,6 +285,20 @@ def _validate_data(data,min_rows=30):
         return None
     return frame
 
+def _log_error_once(key,message,level="warning"):
+    now = time.time()
+
+    with _ERROR_LOCK:
+        previous = _LAST_ERRORS.get(key,0)
+
+        if now-previous < 300:
+            return
+
+        _LAST_ERRORS[key] = now
+
+    log_method = getattr(logger,level,logger.warning)
+    log_method("%s",message)
+
 def _request_json(url,params=None):
     last_error = None
 
@@ -283,32 +310,92 @@ def _request_json(url,params=None):
                 timeout=REQUEST_TIMEOUT
             )
 
-            response.raise_for_status()
-            result = response.json()
+            if response.status_code == 429:
+                global _TWELVE_COOLDOWN_UNTIL
+                _TWELVE_COOLDOWN_UNTIL = max(
+                    _TWELVE_COOLDOWN_UNTIL,
+                    time.time()+TWELVE_COOLDOWN_SECONDS
+                )
+                raise ProviderError(
+                    "Provider rate limit reached",
+                    429
+                )
+
+            if response.status_code >= 400:
+                try:
+                    body = response.json()
+                    message = body.get(
+                        "message",
+                        body.get("code","Provider request rejected")
+                    )
+                except Exception:
+                    message = "Provider request rejected"
+
+                raise ProviderError(
+                    str(message),
+                    response.status_code
+                )
+
+            try:
+                result = response.json()
+            except Exception:
+                raise ProviderError("Invalid JSON response")
 
             if isinstance(result,dict):
                 if result.get("status") == "error":
-                    raise ValueError(
+                    raise ProviderError(
                         result.get("message","Provider error")
                     )
 
                 if result.get("code") and "values" not in result:
-                    raise ValueError(
+                    raise ProviderError(
                         result.get("message","Provider error")
                     )
 
             return result
 
+        except ProviderError as error:
+            last_error = error
+
+            if error.status_code == 429:
+                break
+
+            if error.status_code is not None and error.status_code < 500:
+                break
+
+        except (requests.Timeout,requests.ConnectionError) as error:
+            last_error = error
+
         except Exception as error:
             last_error = error
-            logger.warning(
-                "Request attempt %s failed: %s",
-                attempt+1,error
-            )
-            if attempt < MAX_RETRIES-1:
-                time.sleep(0.5*(attempt+1))
+            break
 
-    raise RuntimeError(str(last_error))
+        if attempt < MAX_RETRIES-1:
+            time.sleep(0.5*(attempt+1))
+
+    raise RuntimeError(str(last_error or "Provider request failed"))
+
+def _wait_twelve_slot():
+    global _TWELVE_LAST_REQUEST
+
+    with _TWELVE_LOCK:
+        now = time.time()
+
+        if now < _TWELVE_COOLDOWN_UNTIL:
+            raise ProviderError(
+                "Twelve Data temporarily paused after rate limit",
+                429
+            )
+
+        wait_time = (
+            TWELVE_MIN_INTERVAL -
+            (now-_TWELVE_LAST_REQUEST)
+        )
+
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+        _TWELVE_LAST_REQUEST = time.time()
 
 def _fetch_binance(symbol,interval,limit=DEFAULT_LIMIT):
     if interval not in BINANCE_INTERVALS:
@@ -341,19 +428,27 @@ def _fetch_binance(symbol,interval,limit=DEFAULT_LIMIT):
 
     return _validate_data(frame.set_index("time"))
 
-def _fetch_twelve(symbol,interval,outputsize=5000):
+def _fetch_twelve(symbol,interval,outputsize=None):
     if not TWELVE_API_KEY:
         return None
 
     if interval not in TWELVE_INTERVALS:
         return None
 
+    _wait_twelve_slot()
+
     provider_symbol = TWELVE_SYMBOLS.get(symbol,symbol)
+
+    requested_size = (
+        TWELVE_OUTPUTSIZE
+        if outputsize is None
+        else int(outputsize)
+    )
 
     params = {
         "symbol":provider_symbol,
         "interval":TWELVE_INTERVALS[interval],
-        "outputsize":min(max(int(outputsize),30),5000),
+        "outputsize":min(max(requested_size,30),5000),
         "timezone":"UTC",
         "apikey":TWELVE_API_KEY
     }
@@ -362,7 +457,7 @@ def _fetch_twelve(symbol,interval,outputsize=5000):
 
     if not isinstance(payload,dict) or "values" not in payload:
         if isinstance(payload,dict):
-            raise ValueError(
+            raise ProviderError(
                 payload.get("message","Twelve Data returned no values")
             )
         return None
@@ -390,8 +485,10 @@ def _fetch_yahoo(symbol,interval,period=None):
 
     if period is None:
         period = (
-            "60d"
-            if interval in ["1m","2m","5m","15m","30m","1h"]
+            "7d"
+            if interval in ["1m"]
+            else "60d"
+            if interval in ["2m","5m","15m","30m","1h"]
             else "2y"
         )
 
@@ -413,11 +510,17 @@ def _resample_data(data,rule,min_rows=30):
         return None
 
     try:
+        arguments = {
+            "label":"left",
+            "closed":"left"
+        }
+
+        if not str(rule).upper().endswith("D"):
+            arguments["origin"] = "epoch"
+
         result = frame.resample(
             rule,
-            origin="epoch",
-            label="left",
-            closed="left"
+            **arguments
         ).agg({
             "open":"first",
             "high":"max",
@@ -433,9 +536,9 @@ def _resample_data(data,rule,min_rows=30):
         return _validate_data(result,min_rows=min_rows)
 
     except Exception as error:
-        logger.warning(
-            "Resample failed for %s: %s",
-            rule,error
+        _log_error_once(
+            f"resample:{rule}",
+            f"Resample failed for {rule}: {error}"
         )
         return None
 
@@ -508,6 +611,14 @@ def _set_cached(symbol,timeframe,data,provider,elapsed_seconds=0):
             "stored_at":time.time()
         }
 
+CACHE_SECONDS = {
+"1m":15,"3m":20,"5m":30,"15m":45,
+"30m":60,"45m":60,"1h":90,"2h":120,
+"4h":180,"6h":240,"8h":300,"12h":300,
+"1d":600,"3d":900,"1w":1200,"1mo":1800,
+"45d":1800,"90d":1800,"144d":1800
+}
+
 def _custom_rule(timeframe):
     rules = {
         "3d":"3D",
@@ -517,22 +628,63 @@ def _custom_rule(timeframe):
     }
     return rules.get(timeframe)
 
-def _fetch_daily_for_custom(symbol):
+def _derived_rule(timeframe):
+    rules = {
+        "3m":("1m","3min"),
+        "6h":("1h","6h"),
+        "8h":("1h","8h"),
+        "12h":("1h","12h")
+    }
+    return rules.get(timeframe)
+
+def _fetch_from_sources(symbol,timeframe):
     errors = []
 
-    for source in _source_candidates(symbol,"1d"):
+    for source in _source_candidates(symbol,timeframe):
         try:
-            data = _fetch_source(symbol,"1d",source)
+            data = _fetch_source(symbol,timeframe,source)
 
             if data is not None and len(data) >= 30:
                 return data,source,None
 
-            errors.append(f"{source}: insufficient daily history")
+            errors.append(f"{source}: insufficient data")
 
         except Exception as error:
-            errors.append(f"{source}: {str(error)}")
+            message = str(error)
+            errors.append(f"{source}: {message}")
+
+            _log_error_once(
+                f"{symbol}:{timeframe}:{source}:{type(error).__name__}",
+                f"Provider {source} failed for {symbol} {timeframe}: {message}"
+            )
 
     return None,None,"; ".join(errors)
+
+def _fetch_daily_for_custom(symbol):
+    return _fetch_from_sources(symbol,"1d")
+
+def _fetch_derived(symbol,base_timeframe,rule):
+    base_info = fetch_timeframe_info(
+        symbol,
+        base_timeframe
+    )
+
+    data = base_info["data"]
+    source = base_info["provider"]
+
+    if data is None:
+        return None,source,base_info["error"]
+
+    result = _resample_data(
+        data,
+        rule,
+        min_rows=30
+    )
+
+    if result is None or len(result) < 30:
+        return None,source,"Insufficient history after resampling"
+
+    return result,source,None
 
 def fetch_timeframe_info(symbol,timeframe,force_refresh=False):
     normalized = _resolve_symbol(symbol)
@@ -567,7 +719,11 @@ def fetch_timeframe_info(symbol,timeframe,force_refresh=False):
         daily,source,error = _fetch_daily_for_custom(normalized)
 
         if daily is not None:
-            result = _resample_data(daily,rule,min_rows=3)
+            result = _resample_data(
+                daily,
+                rule,
+                min_rows=3
+            )
 
             if result is not None and len(result) >= 3:
                 elapsed = round(time.time()-started,3)
@@ -598,48 +754,72 @@ def fetch_timeframe_info(symbol,timeframe,force_refresh=False):
             "cached":False
         }
 
-    errors = []
+    derived = _derived_rule(timeframe)
 
-    for source in _source_candidates(normalized,timeframe):
-        try:
-            result = _fetch_source(
+    if derived:
+        base_timeframe,derived_rule = derived
+
+        result,source,error = _fetch_derived(
+            normalized,
+            base_timeframe,
+            derived_rule
+        )
+
+        if result is not None:
+            elapsed = round(time.time()-started,3)
+
+            _set_cached(
                 normalized,
                 timeframe,
-                source
+                result,
+                source,
+                elapsed
             )
 
-            if result is not None and len(result) >= 30:
-                elapsed = round(time.time()-started,3)
+            return {
+                "data":result,
+                "provider":source,
+                "error":None,
+                "elapsed_seconds":elapsed,
+                "cached":False
+            }
 
-                _set_cached(
-                    normalized,
-                    timeframe,
-                    result,
-                    source,
-                    elapsed
-                )
+        return {
+            "data":None,
+            "provider":source,
+            "error":error or "Derived timeframe unavailable",
+            "elapsed_seconds":round(time.time()-started,3),
+            "cached":False
+        }
 
-                return {
-                    "data":result,
-                    "provider":source,
-                    "error":None,
-                    "elapsed_seconds":elapsed,
-                    "cached":False
-                }
+    result,source,error = _fetch_from_sources(
+        normalized,
+        timeframe
+    )
 
-            errors.append(f"{source}: no sufficient data")
+    if result is not None:
+        elapsed = round(time.time()-started,3)
 
-        except Exception as error:
-            logger.warning(
-                "Provider %s failed for %s %s: %s",
-                source,normalized,timeframe,error
-            )
-            errors.append(f"{source}: {str(error)}")
+        _set_cached(
+            normalized,
+            timeframe,
+            result,
+            source,
+            elapsed
+        )
+
+        return {
+            "data":result,
+            "provider":source,
+            "error":None,
+            "elapsed_seconds":elapsed,
+            "cached":False
+        }
 
     return {
         "data":None,
         "provider":None,
-        "error":" | ".join(errors) if errors else "Data unavailable",
+        "error":error or "Data unavailable",
         "elapsed_seconds":round(time.time()-started,3),
         "cached":False
     }
@@ -791,38 +971,29 @@ def _live_on_message(ws,message):
                 return
 
             timestamp = payload.get("timestamp")
-
             market_time = None
 
             if timestamp is not None:
-                market_time = datetime.fromtimestamp(
-                    float(timestamp),
-                    tz=timezone.utc
-                ).isoformat()
+                try:
+                    market_time = datetime.fromtimestamp(
+                        float(timestamp),
+                        tz=timezone.utc
+                    ).isoformat()
+                except (TypeError,ValueError,OverflowError,OSError):
+                    market_time = None
 
-            received_time = datetime.now(
+            received_at = datetime.now(
                 timezone.utc
             ).isoformat()
 
             with _LIVE_LOCK:
-                _LIVE_DATA.update({
-                    "symbol":"XAU/USD",
-                    "price":price,
-                    "timestamp":market_time,
-                    "received_at":received_time,
-                    "provider":"twelve",
-                    "status":"live",
-                    "error":None
-                })
-
-        elif event == "subscribe-status":
-            if payload.get("fails"):
-                _live_set_status(
-                    "subscription_error",
-                    str(payload.get("fails"))
-                )
-
-            logger.info("Subscription status: %s",payload)
+                _LIVE_DATA["symbol"] = symbol or "XAU/USD"
+                _LIVE_DATA["price"] = price
+                _LIVE_DATA["timestamp"] = market_time
+                _LIVE_DATA["received_at"] = received_at
+                _LIVE_DATA["provider"] = "twelve"
+                _LIVE_DATA["status"] = "connected"
+                _LIVE_DATA["error"] = None
 
         elif payload.get("status") == "error":
             _live_set_status(
@@ -925,10 +1096,20 @@ def get_live_price():
     received = result.get("received_at")
 
     if received:
-        received_dt = datetime.fromisoformat(received)
-        age = (
-            datetime.now(timezone.utc)-received_dt
-        ).total_seconds()
+        try:
+            received_dt = datetime.fromisoformat(received)
+
+            if received_dt.tzinfo is None:
+                received_dt = received_dt.replace(
+                    tzinfo=timezone.utc
+                )
+
+            age = (
+                datetime.now(timezone.utc)-received_dt
+            ).total_seconds()
+
+        except (TypeError,ValueError,OverflowError):
+            age = None
     else:
         age = None
 
@@ -937,7 +1118,7 @@ def get_live_price():
     )
 
     result["is_fresh"] = (
-        age is not None and age <= 15
+        age is not None and 0 <= age <= 15
     )
 
     if age is not None and age > 15:
