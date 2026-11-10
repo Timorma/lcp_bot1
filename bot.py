@@ -22,6 +22,7 @@ from fetcher import fetch_market_bundle
 from analyzer import analyze_multitimeframe
 from chart_drawer import generate_timeframe_chart
 
+from ai_brain import interpret_analysis
 
 # ==============================
 # ICB BOT CONFIGURATION
