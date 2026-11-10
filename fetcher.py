@@ -1,594 +1,398 @@
-
 import os
+import time
 import logging
 import requests
 import pandas as pd
+import numpy as np
 import yfinance as yf
-
 from datetime import datetime, timezone
-from urllib.parse import quote
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
-BINANCE_BASE_URL = "https://data-api.binance.vision/api/v3/klines"
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
-
 TIMEFRAMES = [
-    "1m", "3m", "5m", "15m", "30m", "45m",
-    "1h", "2h", "4h", "6h", "8h", "12h",
-    "1d", "3d", "1w", "1mo", "45d", "90d", "144d"
+"1m","3m","5m","15m","30m","45m",
+"1h","2h","4h","6h","8h","12h",
+"1d","3d","1w","1mo","45d","90d","144d"
 ]
 
 BINANCE_INTERVALS = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "6h": "6h",
-    "8h": "8h",
-    "12h": "12h",
-    "1d": "1d",
-    "1w": "1w",
-    "1mo": "1M"
+"1m":"1m","3m":"3m","5m":"5m","15m":"15m",
+"30m":"30m","1h":"1h","2h":"2h","4h":"4h",
+"6h":"6h","8h":"8h","12h":"12h",
+"1d":"1d","1w":"1w","1mo":"1M"
 }
 
 TWELVE_INTERVALS = {
-    "1m": "1min",
-    "3m": "3min",
-    "5m": "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "45m": "45min",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "6h": "6h",
-    "8h": "8h",
-    "12h": "12h",
-    "1d": "1day",
-    "1w": "1week",
-    "1mo": "1month"
+"1min":"1min","3min":"3min","5min":"5min",
+"15min":"15min","30min":"30min","45min":"45min",
+"1h":"1h","2h":"2h","4h":"4h","6h":"6h",
+"8h":"8h","12h":"12h","1day":"1day",
+"1week":"1week","1month":"1month"
 }
 
 YAHOO_INTERVALS = {
-    "1m": "1m",
-    "3m": "5m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "45m": "30m",
-    "1h": "60m",
-    "2h": "60m",
-    "4h": "60m",
-    "6h": "60m",
-    "8h": "60m",
-    "12h": "60m",
-    "1d": "1d",
-    "1w": "1wk",
-    "1mo": "1mo"
+"1m":"1m","2m":"2m","5m":"5m","15m":"15m",
+"30m":"30m","60m":"60m","90m":"90m",
+"1h":"60m","1d":"1d","1wk":"1wk",
+"1mo":"1mo"
 }
 
-YAHOO_PERIODS = {
-    "1m": "7d",
-    "3m": "60d",
-    "5m": "60d",
-    "15m": "60d",
-    "30m": "60d",
-    "45m": "60d",
-    "1h": "730d",
-    "2h": "730d",
-    "4h": "730d",
-    "6h": "730d",
-    "8h": "730d",
-    "12h": "730d",
-    "1d": "max",
-    "1w": "max",
-    "1mo": "max"
+ALIASES = {
+"GOLD":"GC=F",
+"XAUUSD":"GC=F",
+"GC":"GC=F",
+"SILVER":"SI=F",
+"XAGUSD":"SI=F",
+"OIL":"CL=F",
+"WTI":"CL=F",
+"BRENT":"BZ=F",
+"SPX":"^GSPC",
+"SP500":"^GSPC",
+"NASDAQ":"^IXIC",
+"DOW":"^DJI",
+"EURUSD":"EURUSD=X",
+"GBPUSD":"GBPUSD=X",
+"USDJPY":"JPY=X",
+"AUDUSD":"AUDUSD=X",
+"USDCAD":"CAD=X",
+"USDCHF":"CHF=X",
+"NZDUSD":"NZD=X"
 }
 
-SYMBOL_ALIASES = {
-    "GOLD": "GC=F",
-    "XAUUSD": "GC=F",
-    "GC": "GC=F",
-    "XAU": "GC=F",
-    "SILVER": "SI=F",
-    "XAGUSD": "SI=F",
-    "SI": "SI=F",
-    "XAG": "SI=F",
-    "OIL": "CL=F",
-    "CRUDE": "CL=F",
-    "WTI": "CL=F",
-    "CL": "CL=F",
-    "BRENT": "BZ=F",
-    "BZ": "BZ=F",
-    "SPX": "^GSPC",
-    "SP500": "^GSPC",
-    "S&P500": "^GSPC",
-    "GSPC": "^GSPC",
-    "NASDAQ": "^IXIC",
-    "NSQ": "^IXIC",
-    "IXIC": "^IXIC",
-    "DOW": "^DJI",
-    "DJI": "^DJI"
-}
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+TWELVE_URL = "https://api.twelvedata.com/time_series"
 
-YAHOO_SYMBOLS = set(SYMBOL_ALIASES.values())
+REQUEST_TIMEOUT = 20
+MAX_RETRIES = 3
+DEFAULT_LIMIT = 1000
 
+TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+_CACHE = {}
+_CACHE_LOCK = Lock()
+_CACHE_SECONDS = 60
+
+def _safe_number(value):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else None
+    except (TypeError,ValueError,OverflowError):
+        return None
 
 def _normalize_symbol(symbol):
-    value = str(symbol).strip().upper()
-    return SYMBOL_ALIASES.get(value, value)
+    return str(symbol).strip().upper().replace("/","")
 
+def _resolve_symbol(symbol):
+    normalized = _normalize_symbol(symbol)
+    return ALIASES.get(normalized,normalized)
 
-def _utc_now():
-    return pd.Timestamp.now(tz="UTC")
-
+def _empty_frame():
+    index = pd.DatetimeIndex([],tz="UTC",name="time")
+    return pd.DataFrame(
+        columns=["open","high","low","close","volume"],
+        index=index
+    )
 
 def _normalize_dataframe(data):
-    if data is None or not isinstance(data, pd.DataFrame):
-        return None
-    if data.empty:
-        return None
-
-    data = data.copy()
-    data.columns = [str(col).capitalize() for col in data.columns]
-
-    required = ["Open", "High", "Low", "Close"]
-    if any(col not in data.columns for col in required):
-        return None
-
-    if "Volume" not in data.columns:
-        data["Volume"] = float("nan")
-
-    for column in required + ["Volume"]:
-        data[column] = pd.to_numeric(
-            data[column],
-            errors="coerce"
-        )
-
-    data = data.dropna(subset=required)
-    data = data[~data.index.duplicated(keep="last")]
-    data = data.sort_index()
-
-    if not isinstance(data.index, pd.DatetimeIndex):
-        data.index = pd.to_datetime(data.index, utc=True)
-
-    if data.index.tz is None:
-        data.index = data.index.tz_localize("UTC")
-    else:
-        data.index = data.index.tz_convert("UTC")
-
-    return data[required + ["Volume"]]
-
-
-def _validate_data(data, symbol, timeframe):
-    data = _normalize_dataframe(data)
-
     if data is None:
-        logger.warning(
-            "No valid data for %s on %s",
-            symbol,
-            timeframe
-        )
-        return None
-
-    if len(data) < 20:
-        logger.warning(
-            "Insufficient data for %s on %s: %s rows",
-            symbol,
-            timeframe,
-            len(data)
-        )
-        return None
-
-    return data
-
-
-def _drop_incomplete_fixed_bars(data, timeframe):
-    if data is None or data.empty:
-        return data
-
-    now = _utc_now()
-
-    if timeframe.endswith("d") and timeframe[:-1].isdigit():
-        days = int(timeframe[:-1])
-        cutoff = now.floor("D")
-        data = data[data.index + pd.Timedelta(days=days) <= cutoff]
-
-    elif timeframe == "1w":
-        week_start = now.normalize() - pd.Timedelta(days=now.weekday())
-        data = data[data.index + pd.Timedelta(days=7) <= week_start]
-
-    elif timeframe == "1mo":
-        current_month = now.normalize().replace(day=1)
-        data = data[data.index < current_month]
-
-    return data
-
-
-def _fetch_binance(symbol, timeframe, limit=1000):
-    interval = BINANCE_INTERVALS.get(timeframe)
-
-    if interval is None:
-        return None
-
-    rows = []
-    end_time = None
-    max_pages = 5 if timeframe in ("1d", "1w", "1mo") else 1
-
-    try:
-        for _ in range(max_pages):
-            params = {
-                "symbol": symbol,
-                "interval": interval,
-                "limit": min(limit, 1000)
-            }
-
-            if end_time is not None:
-                params["endTime"] = end_time
-
-            response = requests.get(
-                BINANCE_BASE_URL,
-                params=params,
-                timeout=20
-            )
-
-            response.raise_for_status()
-            batch = response.json()
-
-            if not isinstance(batch, list) or not batch:
-                break
-
-            rows = batch + rows
-            oldest_time = batch[0][0]
-            end_time = oldest_time - 1
-
-            if len(batch) < 1000:
-                break
-
-        if not rows:
-            return None
-
-        columns = [
-            "OpenTime",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "CloseTime",
-            "QuoteVolume",
-            "Trades",
-            "TakerBuyBase",
-            "TakerBuyQuote",
-            "Ignore"
-        ]
-
-        data = pd.DataFrame(rows, columns=columns)
-
-        data["Date"] = pd.to_datetime(
-            data["OpenTime"],
-            unit="ms",
-            utc=True
-        )
-
-        data = data.set_index("Date")
-
-        return data[[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]]
-
-    except Exception:
-        logger.exception(
-            "Binance fetch failed for %s %s",
-            symbol,
-            timeframe
-        )
-        return None
-
-
-def _fetch_twelve_data(symbol, timeframe, outputsize=5000):
-    interval = TWELVE_INTERVALS.get(timeframe)
-
-    if interval is None or not TWELVE_DATA_API_KEY:
-        return None
-
-    try:
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize,
-            "apikey": TWELVE_DATA_API_KEY,
-            "format": "JSON",
-            "timezone": "UTC"
-        }
-
-        response = requests.get(
-            TWELVE_DATA_URL,
-            params=params,
-            timeout=30
-        )
-
-        response.raise_for_status()
-        result = response.json()
-
-        if not isinstance(result, dict) or "values" not in result:
-            logger.warning(
-                "Twelve Data response for %s: %s",
-                symbol,
-                result.get("message", result.get("code", "Invalid response"))
-                if isinstance(result, dict)
-                else "Invalid response"
-            )
-            return None
-
-        data = pd.DataFrame(result["values"])
-
-        if data.empty:
-            return None
-
-        data["datetime"] = pd.to_datetime(
-            data["datetime"],
-            utc=True
-        )
-
-        data = data.set_index("datetime")
-        data.index.name = "Date"
-
-        return data
-
-    except Exception:
-        logger.exception(
-            "Twelve Data fetch failed for %s %s",
-            symbol,
-            timeframe
-        )
-        return None
-
-
-def _fetch_yahoo(symbol, timeframe):
-    interval = YAHOO_INTERVALS.get(timeframe)
-    period = YAHOO_PERIODS.get(timeframe)
-
-    if interval is None or period is None:
-        return None
-
-    try:
-        ticker = yf.Ticker(symbol)
-
-        data = ticker.history(
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            actions=False
-        )
-
-        if data is None or data.empty:
-            return None
-
-        data = data.copy()
-
-        if data.index.tz is None:
-            data.index = data.index.tz_localize("UTC")
-        else:
-            data.index = data.index.tz_convert("UTC")
-
-        return data
-
-    except Exception:
-        logger.exception(
-            "Yahoo Finance fetch failed for %s %s",
-            symbol,
-            timeframe
-        )
-        return None
-
-
-def _resample_data(data, timeframe):
-    if data is None or data.empty:
-        return None
-
-    rules = {
-        "3d": "3D",
-        "45d": "45D",
-        "90d": "90D",
-        "144d": "144D"
+        return _empty_frame()
+    if not isinstance(data,pd.DataFrame):
+        try:
+            data = pd.DataFrame(data)
+        except Exception:
+            return _empty_frame()
+    if data.empty:
+        return _empty_frame()
+    frame = data.copy()
+    frame.columns = [str(column).lower().strip() for column in frame.columns]
+    aliases = {
+        "datetime":"time",
+        "date":"time",
+        "timestamp":"time",
+        "adj close":"close",
+        "vol":"volume"
     }
+    frame = frame.rename(columns=aliases)
+    required = ["open","high","low","close"]
+    if not all(column in frame.columns for column in required):
+        return _empty_frame()
+    if "volume" not in frame.columns:
+        frame["volume"] = 0.0
+    for column in ["open","high","low","close","volume"]:
+        frame[column] = pd.to_numeric(frame[column],errors="coerce")
+    frame = frame.replace([np.inf,-np.inf],np.nan)
+    frame = frame.dropna(subset=required)
+    frame = frame.loc[
+        (frame["high"] >= frame["low"]) &
+        (frame["high"] >= frame["open"]) &
+        (frame["high"] >= frame["close"]) &
+        (frame["low"] <= frame["open"]) &
+        (frame["low"] <= frame["close"])
+    ]
+    if not isinstance(frame.index,pd.DatetimeIndex):
+        time_column = next(
+            (column for column in ["time","date","datetime"] if column in frame.columns),
+            None
+        )
+        if time_column:
+            frame.index = pd.to_datetime(frame[time_column],utc=True,errors="coerce")
+            frame = frame.drop(columns=[time_column])
+        else:
+            frame.index = pd.to_datetime(frame.index,utc=True,errors="coerce")
+    else:
+        frame.index = pd.to_datetime(frame.index,utc=True,errors="coerce")
+    frame = frame.loc[~frame.index.isna()]
+    frame = frame[~frame.index.duplicated(keep="last")]
+    frame = frame.sort_index()
+    frame.index.name = "time"
+    return frame[["open","high","low","close","volume"]]
 
-    rule = rules.get(timeframe)
-
-    if rule is None:
+def _validate_data(data,min_rows=30):
+    frame = _normalize_dataframe(data)
+    if len(frame) < min_rows:
         return None
+    return frame
 
+def _request_json(url,params=None):
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result,dict) and result.get("status") == "error":
+                raise ValueError(result.get("message","Provider error"))
+            return result
+        except Exception as error:
+            last_error = error
+            time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(str(last_error))
+
+def _fetch_binance(symbol,interval,limit=DEFAULT_LIMIT):
+    if interval not in BINANCE_INTERVALS:
+        return None
+    params = {
+        "symbol":symbol,
+        "interval":BINANCE_INTERVALS[interval],
+        "limit":min(max(int(limit),30),1000)
+    }
+    payload = _request_json(BINANCE_URL,params)
+    if not isinstance(payload,list) or not payload:
+        return None
+    columns = [
+        "time","open","high","low","close","volume",
+        "close_time","quote_volume","trades",
+        "taker_buy_base","taker_buy_quote","ignore"
+    ]
+    frame = pd.DataFrame(payload,columns=columns)
+    frame["time"] = pd.to_datetime(frame["time"],unit="ms",utc=True)
+    return _validate_data(frame.set_index("time"))
+
+def _fetch_twelve(symbol,interval,outputsize=5000):
+    if not TWELVE_API_KEY or interval not in TWELVE_INTERVALS:
+        return None
+    params = {
+        "symbol":symbol,
+        "interval":TWELVE_INTERVALS[interval],
+        "outputsize":min(max(int(outputsize),30),5000),
+        "timezone":"UTC",
+        "apikey":TWELVE_API_KEY
+    }
+    payload = _request_json(TWELVE_URL,params)
+    if not isinstance(payload,dict) or "values" not in payload:
+        return None
+    frame = pd.DataFrame(payload["values"])
+    frame["datetime"] = pd.to_datetime(frame["datetime"],utc=True,errors="coerce")
+    return _validate_data(frame.set_index("datetime"))
+
+def _fetch_yahoo(symbol,interval,period="2y"):
+    yahoo_interval = YAHOO_INTERVALS.get(interval)
+    if not yahoo_interval:
+        return None
+    ticker = yf.Ticker(symbol)
+    frame = ticker.history(
+        period=period,
+        interval=yahoo_interval,
+        auto_adjust=False,
+        actions=False
+    )
+    return _validate_data(frame)
+def _resample_data(data,rule):
+    frame = _normalize_dataframe(data)
+    if frame.empty:
+        return None
     try:
-        aggregation = {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": lambda values: values.sum(min_count=1)
-        }
-
-        result = data.resample(
+        result = frame.resample(
             rule,
             origin="epoch",
             label="left",
             closed="left"
-        ).agg(aggregation)
-
-        result = result.dropna(subset=["Open", "High", "Low", "Close"])
-        result = _drop_incomplete_fixed_bars(result, timeframe)
-
-        return result
-
-    except Exception:
-        logger.exception(
-            "Resampling failed for timeframe %s",
-            timeframe
-        )
+        ).agg({
+            "open":"first",
+            "high":"max",
+            "low":"min",
+            "close":"last",
+            "volume":"sum"
+        })
+        result = result.dropna(subset=["open","high","low","close"])
+        return _validate_data(result)
+    except Exception as error:
+        logger.warning("Resample failed for %s: %s",rule,error)
         return None
 
-
-def _fetch_source(symbol, timeframe, source):
+def _fetch_source(symbol,timeframe,source):
     if source == "binance":
-        return _fetch_binance(symbol, timeframe)
-
-    if source == "yfinance":
-        return _fetch_yahoo(symbol, timeframe)
-
-    if source == "twelvedata":
-        return _fetch_twelve_data(symbol, timeframe)
-
+        return _fetch_binance(symbol,timeframe)
+    if source == "twelve":
+        return _fetch_twelve(symbol,timeframe)
+    if source == "yahoo":
+        return _fetch_yahoo(symbol,timeframe)
     return None
 
+def _source_candidates(symbol,timeframe):
+    crypto = symbol.endswith("USDT") and symbol.isalnum()
+    if crypto:
+        return ["binance","twelve"]
+    if symbol in ALIASES.values() or "=" in symbol or symbol.startswith("^"):
+        return ["twelve","yahoo"]
+    return ["twelve","yahoo"]
 
-def _get_source(symbol):
-    if symbol in YAHOO_SYMBOLS or "=" in symbol or symbol.startswith("^"):
-        return "yfinance"
+def _cache_key(symbol,timeframe):
+    return f"{symbol}:{timeframe}"
 
-    if symbol.endswith("USDT"):
-        return "binance"
-
-    return "twelvedata"
-
-
-def fetch_timeframe(symbol, timeframe):
-    symbol = _normalize_symbol(symbol)
-
-    if timeframe not in TIMEFRAMES:
-        logger.warning("Unsupported timeframe: %s", timeframe)
-        return None
-
-    source = _get_source(symbol)
-
-    if timeframe in ("3d", "45d", "90d", "144d"):
-        daily = _fetch_source(symbol, "1d", source)
-
-        if daily is None:
+def _get_cached(symbol,timeframe):
+    key = _cache_key(symbol,timeframe)
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if not item:
             return None
-
-        daily = _normalize_dataframe(daily)
-
-        if daily is None:
+        age = time.time() - item["stored_at"]
+        if age > _CACHE_SECONDS:
+            _CACHE.pop(key,None)
             return None
+        return item.copy()
 
-        result = _resample_data(daily, timeframe)
-        return _validate_data(result, symbol, timeframe)
-
-    if source == "binance" and timeframe not in BINANCE_INTERVALS:
-        if timeframe == "45m":
-            base = _fetch_binance(symbol, "15m")
-            if base is not None:
-                result = base.resample("45min").agg({
-                    "Open": "first",
-                    "High": "max",
-                    "Low": "min",
-                    "Close": "last",
-                    "Volume": lambda values: values.sum(min_count=1)
-                })
-                return _validate_data(result, symbol, timeframe)
-        return None
-
-    if source == "yfinance" and timeframe in ("3m", "45m", "2h", "4h", "6h", "8h", "12h"):
-        base_timeframe = "5m" if timeframe == "3m" else "30m" if timeframe == "45m" else "1h"
-        base = _fetch_yahoo(symbol, base_timeframe)
-        if base is None:
-            return None
-
-        rules = {
-            "3m": "3min",
-            "45m": "45min",
-            "2h": "2h",
-            "4h": "4h",
-            "6h": "6h",
-            "8h": "8h",
-            "12h": "12h"
+def _set_cached(symbol,timeframe,result):
+    key = _cache_key(symbol,timeframe)
+    with _CACHE_LOCK:
+        _CACHE[key] = {
+            "data":result.copy() if result is not None else None,
+            "stored_at":time.time()
         }
 
-        result = base.resample(rules[timeframe]).agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": lambda values: values.sum(min_count=1)
-        })
+def _custom_rule(timeframe):
+    rules = {
+        "3d":"3D",
+        "45d":"45D",
+        "90d":"90D",
+        "144d":"144D"
+    }
+    return rules.get(timeframe)
 
-        return _validate_data(result, symbol, timeframe)
-
-    data = _fetch_source(symbol, timeframe, source)
-
-    if data is None and source == "twelvedata":
-        logger.warning(
-            "No Twelve Data result for %s %s",
-            symbol,
-            timeframe
-        )
-        return None
-
-    data = _validate_data(data, symbol, timeframe)
-
-    if data is None:
-        return None
-
-    data = _drop_incomplete_fixed_bars(data, timeframe)
-
-    return _validate_data(data, symbol, timeframe)
-
-
-def fetch_market_bundle(symbol, timeframes=None):
-    symbol = _normalize_symbol(symbol)
-    requested = list(timeframes or TIMEFRAMES)
-
-    bundle = {}
-    daily_cache = None
-
-    for timeframe in requested:
+def _fetch_daily_for_custom(symbol):
+    candidates = _source_candidates(symbol,"1d")
+    for source in candidates:
         try:
-            if timeframe in ("3d", "45d", "90d", "144d"):
-                if daily_cache is None:
-                    daily_cache = fetch_timeframe(symbol, "1d")
+            data = _fetch_source(symbol,"1d",source)
+            if data is not None and len(data) >= 30:
+                return data,source
+        except Exception as error:
+            logger.warning("%s daily fetch failed: %s",source,error)
+    return None,None
 
-                if daily_cache is None:
-                    bundle[timeframe] = {"data": None, "error": "Daily data unavailable"}
-                    continue
+def fetch_timeframe(symbol,timeframe,force_refresh=False):
+    normalized = _resolve_symbol(symbol)
+    timeframe = str(timeframe).strip()
+    if timeframe not in TIMEFRAMES:
+        return None
+    cached = None if force_refresh else _get_cached(normalized,timeframe)
+    if cached and cached.get("data") is not None:
+        return cached["data"].copy()
+    rule = _custom_rule(timeframe)
+    if rule:
+        daily,source = _fetch_daily_for_custom(normalized)
+        result = _resample_data(daily,rule) if daily is not None else None
+        if result is not None:
+            _set_cached(normalized,timeframe,result)
+            return result.copy()
+        return None
+    candidates = _source_candidates(normalized,timeframe)
+    for source in candidates:
+        try:
+            result = _fetch_source(normalized,timeframe,source)
+            if result is not None and len(result) >= 30:
+                _set_cached(normalized,timeframe,result)
+                return result.copy()
+        except Exception as error:
+            logger.warning(
+                "Provider %s failed for %s %s: %s",
+                source,normalized,timeframe,error
+            )
+    return None
 
-                result = _resample_data(daily_cache, timeframe)
-                result = _validate_data(result, symbol, timeframe)
-
-            else:
-                result = fetch_timeframe(symbol, timeframe)
-
-                if timeframe == "1d" and result is not None:
-                    daily_cache = result
-
+def fetch_market_bundle(symbol,timeframes=None,force_refresh=False):
+    normalized = _resolve_symbol(symbol)
+    selected = list(timeframes or TIMEFRAMES)
+    bundle = {}
+    for timeframe in selected:
+        started = time.time()
+        try:
+            data = fetch_timeframe(
+                normalized,
+                timeframe,
+                force_refresh=force_refresh
+            )
+            elapsed = round(time.time()-started,3)
             bundle[timeframe] = {
-                "data": result,
-                "error": None if result is not None else "Data unavailable"
+                "data":data,
+                "error":None if data is not None else "Data unavailable",
+                "provider":"auto",
+                "elapsed_seconds":elapsed,
+                "last_candle_time":(
+                    data.index[-1].isoformat()
+                    if data is not None and not data.empty
+                    else None
+                ),
+                "rows":len(data) if data is not None else 0
             }
-
-        except Exception as exc:
+        except Exception as error:
             logger.exception(
-                "Bundle fetch failed for %s %s",
-                symbol,
-                timeframe
+                "Market bundle error: %s %s",
+                normalized,timeframe
             )
             bundle[timeframe] = {
-                "data": None,
-                "error": str(exc)
+                "data":None,
+                "error":str(error),
+                "provider":None,
+                "elapsed_seconds":round(time.time()-started,3),
+                "last_candle_time":None,
+                "rows":0
             }
-
     return bundle
 
+def fetch_market_data(symbol,timeframe="1d",force_refresh=False):
+    return fetch_timeframe(symbol,timeframe,force_refresh)
 
-def fetch_market_data(symbol, timeframe="1d"):
-    return fetch_timeframe(symbol, timeframe)
+def clear_cache():
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+def get_cache_status():
+    now = time.time()
+    with _CACHE_LOCK:
+        return {
+            key:{
+                "age_seconds":round(now-value["stored_at"],2),
+                "rows":(
+                    len(value["data"])
+                    if value["data"] is not None
+                    else 0
+                )
+            }
+            for key,value in _CACHE.items()
+        }
