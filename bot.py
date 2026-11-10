@@ -21,8 +21,8 @@ from telegram.ext import (
 from fetcher import fetch_market_bundle
 from analyzer import analyze_multitimeframe
 from chart_drawer import generate_timeframe_chart
-
 from ai_brain import interpret_analysis
+
 
 # ==============================
 # ICB BOT CONFIGURATION
@@ -39,7 +39,8 @@ DAILY_REPORT_TIME = time(hour=3, minute=0, tzinfo=CAIRO_TZ)
 
 DAILY_SYMBOLS = ["GOLD", "BTCUSDT"]
 
-MAX_REPORT_LENGTH = 3900
+MAX_REPORT_LENGTH = 3500
+MAX_AI_CHUNK_LENGTH = 3000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +63,10 @@ def load_json_file(filename):
 
     try:
         with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+
     except Exception:
         logger.exception("Cannot read symbols file: %s", filename)
         return {}
@@ -88,6 +92,7 @@ def load_symbol_configuration():
     def collect_crypto_symbols(data):
         if isinstance(data, str):
             value = normalize_symbol(data)
+
             if value:
                 crypto_symbols.add(value)
 
@@ -102,8 +107,10 @@ def load_symbol_configuration():
 
                 if key == "symbols":
                     collect_crypto_symbols(value)
+
                 elif isinstance(value, (dict, list)):
                     collect_crypto_symbols(value)
+
                 elif isinstance(value, str):
                     collect_crypto_symbols(value)
 
@@ -135,6 +142,7 @@ def resolve_symbol(user_symbol):
 
 def refresh_symbols():
     global SYMBOL_ALIASES, CRYPTO_SYMBOLS
+
     SYMBOL_ALIASES, CRYPTO_SYMBOLS = load_symbol_configuration()
 
 
@@ -149,7 +157,11 @@ async def is_subscribed(user_id, context):
             user_id=user_id
         )
 
-        return member.status in ("creator", "administrator", "member")
+        return member.status in (
+            "creator",
+            "administrator",
+            "member"
+        )
 
     except Exception:
         logger.exception("Subscription verification failed")
@@ -261,8 +273,18 @@ def format_group(group):
     if agreement is not None:
         result += f"\nالتوافق: {safe_value(agreement)}"
 
+    available = group.get("available")
+    requested = group.get("requested")
+
+    if available is not None and requested is not None:
+        result += f"\nالفريمات المتاحة: {available}/{requested}"
+
     return result
 
+
+# ==============================
+# BUILD MAIN REPORT
+# ==============================
 
 def build_report(symbol, analysis):
     if not isinstance(analysis, dict):
@@ -317,24 +339,26 @@ def build_report(symbol, analysis):
         report.append(
             f"قوة النموذج النسبية: {escape(safe_value(confidence))}"
         )
+
         report.append(
-            "<i>هذه درجة تقييم داخلية وليست احتمالاً مضموناً.</i>"
+            "<i>هذه درجة تقييم داخلية وليست احتمالاً لنجاح حركة مستقبلية.</i>"
         )
+
         report.append("")
 
     report.extend([
         "📌 <b>تحليل المجموعات الزمنية</b>",
         "",
         "🔵 <b>الرئيسي</b>",
-        escape(format_group(groups.get("main", {}))),
+        escape(format_group(groups.get("الرئيسي", {}))),
         f"الاتجاه: {escape(main_direction)}",
         "",
         "🟡 <b>المتوسط</b>",
-        escape(format_group(groups.get("medium", {}))),
+        escape(format_group(groups.get("المتوسط", {}))),
         f"الاتجاه: {escape(medium_direction)}",
         "",
         "🟢 <b>القصير</b>",
-        escape(format_group(groups.get("short", {}))),
+        escape(format_group(groups.get("القصير", {}))),
         f"الاتجاه: {escape(short_direction)}",
         "",
         "━━━━━━━━━━━━━━━━━━",
@@ -354,9 +378,87 @@ def build_report(symbol, analysis):
     text = "\n".join(report)
 
     if len(text) > MAX_REPORT_LENGTH:
-        text = text[:MAX_REPORT_LENGTH - 30] + "\n\n<i>تم اختصار التقرير.</i>"
+        text = (
+            text[:MAX_REPORT_LENGTH - 60]
+            + "\n\n<i>تم اختصار التقرير للحفاظ على طول الرسالة.</i>"
+        )
 
     return text
+
+
+# ==============================
+# SEND AI INTERPRETATION
+# ==============================
+
+async def send_ai_report(bot, chat_id, symbol, analysis):
+    try:
+        ai_report = await asyncio.to_thread(
+            interpret_analysis,
+            symbol,
+            analysis
+        )
+
+        if not ai_report:
+            ai_report = "لم ينتج عقل ICB تفسيراً لهذه البيانات."
+
+        ai_report = str(ai_report).strip()
+
+        chunks = []
+
+        while ai_report:
+            if len(ai_report) <= MAX_AI_CHUNK_LENGTH:
+                chunks.append(ai_report)
+                break
+
+            split_at = ai_report.rfind(
+                "\n",
+                0,
+                MAX_AI_CHUNK_LENGTH
+            )
+
+            if split_at < MAX_AI_CHUNK_LENGTH // 2:
+                split_at = ai_report.rfind(
+                    " ",
+                    0,
+                    MAX_AI_CHUNK_LENGTH
+                )
+
+            if split_at < MAX_AI_CHUNK_LENGTH // 2:
+                split_at = MAX_AI_CHUNK_LENGTH
+
+            chunks.append(ai_report[:split_at].strip())
+            ai_report = ai_report[split_at:].strip()
+
+        for index, chunk in enumerate(chunks):
+            heading = (
+                "🧠 <b>ICB AI INTERPRETATION</b>\n"
+                f"الأداة: <b>{escape(symbol)}</b>\n"
+            )
+
+            if len(chunks) > 1:
+                heading += f"الجزء {index + 1}/{len(chunks)}\n"
+
+            heading += "\n"
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=heading + escape(chunk),
+                parse_mode="HTML"
+            )
+
+    except Exception:
+        logger.exception(
+            "AI report delivery failed for %s",
+            symbol
+        )
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ تعذر إرسال تفسير Groq للأداة {symbol}.\n"
+                "التقرير الحسابي الأساسي ما زال متاحاً."
+            )
+        )
 
 
 # ==============================
@@ -413,11 +515,21 @@ async def send_analysis(update, context, user_symbol):
     try:
         bundle, analysis = await run_analysis(resolved)
 
-        report = build_report(user_symbol, analysis)
+        report = build_report(
+            user_symbol,
+            analysis
+        )
 
         await status_message.edit_text(
             report,
             parse_mode="HTML"
+        )
+
+        await send_ai_report(
+            context.bot,
+            message.chat_id,
+            user_symbol,
+            analysis
         )
 
         try:
@@ -441,7 +553,10 @@ async def send_analysis(update, context, user_symbol):
             logger.exception("Chart generation failed")
 
     except Exception as error:
-        logger.exception("Analysis failed for %s", user_symbol)
+        logger.exception(
+            "Analysis failed for %s",
+            user_symbol
+        )
 
         await status_message.edit_text(
             "❌ تعذر إكمال التحليل.\n\n"
@@ -455,7 +570,10 @@ async def send_analysis(update, context, user_symbol):
 # START COMMAND
 # ==============================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not await check_access(update, context):
         return
 
@@ -466,6 +584,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze GOLD - تحليل الذهب\n"
         "/analyze BTCUSDT - تحليل البيتكوين\n"
         "/symbols - عرض الرموز المتاحة\n"
+        "/daily - تفعيل التقرير اليومي\n"
         "/help - المساعدة\n\n"
         "أو أرسل الرمز مباشرة في رسالة.",
         parse_mode="HTML"
@@ -476,7 +595,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP COMMAND
 # ==============================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not await check_access(update, context):
         return
 
@@ -485,10 +607,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. أرسل /analyze ثم اسم الأداة.\n"
         "2. انتظر جمع البيانات من المصادر.\n"
         "3. سيظهر التقرير متعدد الأطر الزمنية.\n"
-        "4. قد يظهر الرسم البياني إذا توفرت بياناته.\n\n"
+        "4. سيظهر تفسير Groq بعد التقرير الحسابي.\n"
+        "5. قد يظهر الرسم البياني إذا توفرت بياناته.\n\n"
         "أمثلة:\n"
         "<code>/analyze GOLD</code>\n"
         "<code>/analyze BTCUSDT</code>\n\n"
+        "للتقرير اليومي أرسل /daily.\n\n"
         "التقارير مخصصة للبحث ودراسة حركة السوق.",
         parse_mode="HTML"
     )
@@ -498,7 +622,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SYMBOLS COMMAND
 # ==============================
 
-async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def symbols_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not await check_access(update, context):
         return
 
@@ -513,17 +640,25 @@ async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🟡 <b>العملات والسلع والمؤشرات</b>"
     ]
 
-    lines.extend(f"• {escape(item)}" for item in forex_names[:60])
+    lines.extend(
+        f"• {escape(item)}"
+        for item in forex_names[:60]
+    )
 
     lines.extend([
         "",
         "₿ <b>العملات الرقمية</b>"
     ])
 
-    lines.extend(f"• {escape(item)}" for item in crypto_names[:60])
+    lines.extend(
+        f"• {escape(item)}"
+        for item in crypto_names[:60]
+    )
 
     if not forex_names and not crypto_names:
-        lines.append("لم يتم العثور على رموز في ملفات JSON.")
+        lines.append(
+            "لم يتم العثور على رموز في ملفات JSON."
+        )
 
     await update.effective_message.reply_text(
         "\n".join(lines),
@@ -535,7 +670,10 @@ async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ANALYZE COMMAND
 # ==============================
 
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def analyze_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not await check_access(update, context):
         return
 
@@ -548,14 +686,22 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     symbol = context.args[0]
-    await send_analysis(update, context, symbol)
+
+    await send_analysis(
+        update,
+        context,
+        symbol
+    )
 
 
 # ==============================
 # DIRECT SYMBOL MESSAGE
 # ==============================
 
-async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not await check_access(update, context):
         return
 
@@ -570,7 +716,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     refresh_symbols()
 
     if resolve_symbol(text_value):
-        await send_analysis(update, context, text_value)
+        await send_analysis(
+            update,
+            context,
+            text_value
+        )
 
 
 # ==============================
@@ -580,22 +730,37 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Starting ICB daily report")
 
+    chat_id = context.job.chat_id
+
     for symbol in DAILY_SYMBOLS:
         try:
             resolved = resolve_symbol(symbol)
 
             if not resolved:
-                logger.warning("Daily symbol not configured: %s", symbol)
+                logger.warning(
+                    "Daily symbol not configured: %s",
+                    symbol
+                )
                 continue
 
             bundle, analysis = await run_analysis(resolved)
 
-            report = build_report(symbol, analysis)
+            report = build_report(
+                symbol,
+                analysis
+            )
 
             await context.bot.send_message(
-                chat_id=context.job.chat_id,
+                chat_id=chat_id,
                 text=report,
                 parse_mode="HTML"
+            )
+
+            await send_ai_report(
+                context.bot,
+                chat_id,
+                symbol,
+                analysis
             )
 
             chart = await asyncio.to_thread(
@@ -610,16 +775,26 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
                     chart.seek(0)
 
                 await context.bot.send_photo(
-                    chat_id=context.job.chat_id,
+                    chat_id=chat_id,
                     photo=chart,
                     caption=f"ICB Daily Research | {symbol}"
                 )
 
         except Exception:
-            logger.exception("Daily report failed for %s", symbol)
+            logger.exception(
+                "Daily report failed for %s",
+                symbol
+            )
 
 
-async def set_daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==============================
+# SET DAILY REPORT
+# ==============================
+
+async def set_daily_report_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not await check_access(update, context):
         return
 
@@ -650,83 +825,10 @@ async def set_daily_report_command(update: Update, context: ContextTypes.DEFAULT
     await update.effective_message.reply_text(
         "✅ تم تفعيل التقرير اليومي في هذه المحادثة.\n"
         "موعد الإرسال: 03:00 صباحاً بتوقيت القاهرة.\n"
-        "الأدوات: الذهب والبيتكوين."
+        "الأدوات: الذهب والبيتكوين.\n"
+        "سيتم إرسال التحليل الحسابي وتفسير Groq والرسم البياني."
     )
 
 
 # ==============================
-# ERROR HANDLER
-# ==============================
-
-async def error_handler(update, context):
-    logger.exception(
-        "Telegram application error",
-        exc_info=context.error
-    )
-
-
-# ==============================
-# APPLICATION STARTUP
-# ==============================
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing from Railway Variables."
-        )
-
-    logger.info("Loading ICB symbol configuration")
-
-    refresh_symbols()
-
-    logger.info(
-        "Loaded %s aliases and %s crypto symbols",
-        len(SYMBOL_ALIASES),
-        len(CRYPTO_SYMBOLS)
-    )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler("start", start_command)
-    )
-
-    application.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    application.add_handler(
-        CommandHandler("symbols", symbols_command)
-    )
-
-    application.add_handler(
-        CommandHandler("analyze", analyze_command)
-    )
-
-    application.add_handler(
-        CommandHandler("daily", set_daily_report_command)
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_message_handler
-        )
-    )
-
-    application.add_error_handler(error_handler)
-
-    logger.info("ICB BOT IS STARTING")
-
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-if __name__ == "__main__":
-    main()
+# ERROR H
