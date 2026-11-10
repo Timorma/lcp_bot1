@@ -565,7 +565,6 @@ async def send_analysis(update, context, user_symbol):
             parse_mode="HTML"
         )
 
-
 # ==============================
 # START COMMAND
 # ==============================
@@ -831,4 +830,82 @@ async def set_daily_report_command(
 
 
 # ==============================
-# ERROR H
+# ERROR HANDLER
+# ==============================
+
+async def error_handler(update, context):
+    logger.error(
+        "Telegram application error",
+        exc_info=(
+            type(context.error),
+            context.error,
+            context.error.__traceback__
+        ) if context.error else None
+    )
+
+
+# ==============================
+# APPLICATION STARTUP
+# ==============================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing from Railway Variables."
+        )
+
+    logger.info("Loading ICB symbol configuration")
+
+    refresh_symbols()
+
+    logger.info(
+        "Loaded %s aliases and %s crypto symbols",
+        len(SYMBOL_ALIASES),
+        len(CRYPTO_SYMBOLS)
+    )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("symbols", symbols_command)
+    )
+
+    application.add_handler(
+        CommandHandler("analyze", analyze_command)
+    )
+
+    application.add_handler(
+        CommandHandler("daily", set_daily_report_command)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_message_handler
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("ICB BOT IS STARTING")
+
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
