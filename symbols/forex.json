@@ -1,0 +1,26 @@
+
+{
+  "provider": "yfinance",
+  "category": "forex_commodities_indices",
+  "aliases": {
+    "GOLD": "GC=F",
+    "XAUUSD": "GC=F",
+    "GC": "GC=F",
+    "SILVER": "SI=F",
+    "XAGUSD": "SI=F",
+    "OIL": "CL=F",
+    "WTI": "CL=F",
+    "BRENT": "BZ=F",
+    "SPX": "^GSPC",
+    "SP500": "^GSPC",
+    "NASDAQ": "^IXIC",
+    "DOW": "^DJI",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDCAD": "CAD=X",
+    "USDCHF": "CHF=X",
+    "NZDUSD": "NZDUSD=X"
+  }
+}
