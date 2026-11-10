@@ -1,0 +1,42 @@
+
+{
+  "provider": "binance",
+  "category": "crypto",
+  "market_types": [
+    "spot",
+    "usdm_futures"
+  ],
+  "quote_asset": "USDT",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "DOTUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "TRXUSDT",
+    "TONUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "SUIUSDT",
+    "UNIUSDT",
+    "AAVEUSDT",
+    "FILUSDT",
+    "ATOMUSDT",
+    "ETCUSDT",
+    "ICPUSDT",
+    "INJUSDT",
+    "FETUSDT",
+    "RENDERUSDT",
+    "TAOUSDT",
+    "DEXEUSDT"
+  ]
+}
