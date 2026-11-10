@@ -1,12 +1,13 @@
 
 import os
 import json
+import html
 import logging
 import asyncio
+import time
 from pathlib import Path
-from datetime import time
+from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
-from html import escape
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -18,506 +19,367 @@ from telegram.ext import (
     filters
 )
 
-from fetcher import fetch_market_bundle
+from fetcher import (
+    fetch_market_bundle,
+    TIMEFRAMES
+)
 from analyzer import analyze_multitimeframe
+from ai_brain import (
+    interpret_analysis,
+    split_text,
+    get_ai_status
+)
 from chart_drawer import generate_timeframe_chart
-from ai_brain import interpret_analysis
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL","INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 
-# ==============================
-# ICB BOT CONFIGURATION
-# ==============================
+logger = logging.getLogger("ICB")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHANNEL_USERNAME = "@ICBVO"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME","")
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
 
 BASE_DIR = Path(__file__).resolve().parent
 SYMBOLS_DIR = BASE_DIR / "symbols"
 
-DAILY_REPORT_TIME = time(hour=3, minute=0, tzinfo=CAIRO_TZ)
-
-DAILY_SYMBOLS = ["GOLD", "BTCUSDT"]
-
 MAX_REPORT_LENGTH = 3500
 MAX_AI_CHUNK_LENGTH = 3000
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+REQUEST_TIMEOUT = 120
+DAILY_REPORT_TIME = datetime_time(
+    hour=3,
+    minute=0,
+    tzinfo=CAIRO_TZ
 )
 
-logger = logging.getLogger("ICB_BOT")
+DAILY_SYMBOLS = [
+    item.strip().upper()
+    for item in os.getenv(
+        "DAILY_SYMBOLS",
+        "GOLD,BTCUSDT"
+    ).split(",")
+    if item.strip()
+]
 
+ACTIVE_REQUESTS = set()
+ACTIVE_REQUESTS_LOCK = asyncio.Lock()
 
-# ==============================
-# SYMBOL CONFIGURATION
-# ==============================
+def escape_html(value):
+    return html.escape(str(value or ""))
+
+def safe_number(value,digits=4):
+    try:
+        number = float(value)
+        if not __import__("math").isfinite(number):
+            return "N/A"
+        return f"{number:,.{digits}f}"
+    except (TypeError,ValueError,OverflowError):
+        return "N/A"
 
 def load_json_file(filename):
     path = SYMBOLS_DIR / filename
-
     if not path.exists():
-        logger.warning("Symbols file not found: %s", path)
+        logger.warning("Symbol file not found: %s",path)
         return {}
-
     try:
-        with open(path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        return data if isinstance(data, dict) else {}
-
+        with path.open("r",encoding="utf-8") as file:
+            content = json.load(file)
+        return content if isinstance(content,dict) else {}
     except Exception:
-        logger.exception("Cannot read symbols file: %s", filename)
+        logger.exception("Failed to load symbol file: %s",filename)
         return {}
-
-
-def normalize_symbol(symbol):
-    return str(symbol).strip().upper().replace("/", "").replace(" ", "")
-
 
 def load_symbol_configuration():
-    forex_data = load_json_file("forex.json")
-    crypto_data = load_json_file("crypto.json")
+    forex = load_json_file("forex.json")
+    crypto = load_json_file("crypto.json")
+    return {
+        "forex":forex,
+        "crypto":crypto
+    }
 
-    aliases = forex_data.get("aliases", {})
-    normalized_aliases = {}
+SYMBOL_CONFIG = load_symbol_configuration()
 
-    if isinstance(aliases, dict):
-        for name, value in aliases.items():
-            normalized_aliases[normalize_symbol(name)] = str(value).strip()
+def _collect_symbols(config):
+    symbols = set()
+    for category in ["forex","crypto"]:
+        data = config.get(category,{})
+        if not isinstance(data,dict):
+            continue
+        for symbol in data.get("symbols",[]):
+            if isinstance(symbol,str):
+                symbols.add(symbol.strip().upper())
+        aliases = data.get("aliases",{})
+        if isinstance(aliases,dict):
+            symbols.update(
+                str(alias).strip().upper()
+                for alias in aliases.keys()
+            )
+    forex_aliases = SYMBOL_CONFIG.get("forex",{}).get("aliases",{})
+    if isinstance(forex_aliases,dict):
+        symbols.update(
+            str(alias).strip().upper()
+            for alias in forex_aliases.keys()
+        )
+    return symbols
 
-    crypto_symbols = set()
+SUPPORTED_SYMBOLS = _collect_symbols(SYMBOL_CONFIG)
 
-    def collect_crypto_symbols(data):
-        if isinstance(data, str):
-            value = normalize_symbol(data)
+def normalize_symbol(symbol):
+    return str(symbol or "").strip().upper().replace("/","")
 
-            if value:
-                crypto_symbols.add(value)
-
-        elif isinstance(data, list):
-            for item in data:
-                collect_crypto_symbols(item)
-
-        elif isinstance(data, dict):
-            for key, value in data.items():
-                if key in ("provider", "category", "market_types", "quote_asset"):
-                    continue
-
-                if key == "symbols":
-                    collect_crypto_symbols(value)
-
-                elif isinstance(value, (dict, list)):
-                    collect_crypto_symbols(value)
-
-                elif isinstance(value, str):
-                    collect_crypto_symbols(value)
-
-    collect_crypto_symbols(crypto_data)
-
-    return normalized_aliases, crypto_symbols
-
-
-SYMBOL_ALIASES, CRYPTO_SYMBOLS = load_symbol_configuration()
-
-
-def resolve_symbol(user_symbol):
-    original = normalize_symbol(user_symbol)
-
-    if not original:
+def resolve_symbol(symbol):
+    normalized = normalize_symbol(symbol)
+    if not normalized:
         return None
-
-    if original in SYMBOL_ALIASES:
-        return SYMBOL_ALIASES[original]
-
-    if original in CRYPTO_SYMBOLS:
-        return original
-
-    if original.endswith("USDT"):
-        return original
-
+    aliases = SYMBOL_CONFIG.get("forex",{}).get("aliases",{})
+    if isinstance(aliases,dict):
+        for alias,target in aliases.items():
+            if str(alias).upper() == normalized:
+                return normalized
+    if normalized in SUPPORTED_SYMBOLS:
+        return normalized
+    if normalized.endswith("USDT") and normalized[:-4].isalnum():
+        return normalized
     return None
 
-
 def refresh_symbols():
-    global SYMBOL_ALIASES, CRYPTO_SYMBOLS
+    global SYMBOL_CONFIG
+    global SUPPORTED_SYMBOLS
+    SYMBOL_CONFIG = load_symbol_configuration()
+    SUPPORTED_SYMBOLS = _collect_symbols(SYMBOL_CONFIG)
+    return len(SUPPORTED_SYMBOLS)
 
-    SYMBOL_ALIASES, CRYPTO_SYMBOLS = load_symbol_configuration()
-
-
-# ==============================
-# SUBSCRIPTION CHECK
-# ==============================
-
-async def is_subscribed(user_id, context):
-    try:
-        member = await context.bot.get_chat_member(
-            chat_id=CHANNEL_USERNAME,
-            user_id=user_id
-        )
-
-        return member.status in (
-            "creator",
-            "administrator",
-            "member"
-        )
-
-    except Exception:
-        logger.exception("Subscription verification failed")
-        return None
-
-
-async def subscription_message(update):
-    await update.effective_message.reply_text(
-        "لاستخدام بوت ICB يجب الاشتراك في القناة أولاً:\n\n"
-        "https://t.me/ICBVO\n\n"
-        "بعد الاشتراك أرسل /start مرة أخرى."
-    )
-
-
-# ==============================
-# ACCESS CONTROL
-# ==============================
-
-async def check_access(update, context):
-    if not update.effective_user or not update.effective_message:
-        return False
-
-    result = await is_subscribed(
-        update.effective_user.id,
-        context
-    )
-
-    if result is True:
-        return True
-
-    if result is False:
-        await subscription_message(update)
-        return False
-
-    await update.effective_message.reply_text(
-        "تعذر التحقق من الاشتراك حالياً.\n"
-        "حاول مرة أخرى بعد قليل."
-    )
-
-    return False
-
-
-# ==============================
-# REPORT HELPERS
-# ==============================
-
-def safe_value(value, default="غير متاح"):
-    if value is None:
-        return default
-
-    try:
-        if isinstance(value, float) and value != value:
-            return default
-    except Exception:
-        pass
-
-    return str(value)
-
-
-def format_number(value):
-    try:
-        number = float(value)
-
-        if abs(number) >= 1000:
-            return f"{number:,.2f}"
-
-        return f"{number:.5f}".rstrip("0").rstrip(".")
-
-    except Exception:
-        return safe_value(value)
-
-
-def format_levels(levels, limit=5):
-    if not isinstance(levels, list) or not levels:
-        return "لا توجد مستويات كافية"
-
+def _format_levels(levels,limit=5):
+    if not isinstance(levels,list) or not levels:
+        return "غير متاحة"
     lines = []
+    for level in levels[:limit]:
+        if not isinstance(level,dict):
+            continue
+        price = safe_number(level.get("price"),5)
+        strength = safe_number(level.get("strength"),2)
+        lines.append(
+            f"• {price} | القوة النسبية: {strength}"
+        )
+    return "\n".join(lines) if lines else "غير متاحة"
 
-    for item in levels[:limit]:
-        if isinstance(item, dict):
-            price = item.get("price", item.get("level"))
-            strength = item.get("strength", item.get("touches"))
-
-            line = f"• {format_number(price)}"
-
-            if strength is not None:
-                line += f" | القوة: {safe_value(strength)}"
-
-            lines.append(line)
-
-        else:
-            lines.append(f"• {format_number(item)}")
-
-    return "\n".join(lines)
-
-
-def format_group(group):
-    if not isinstance(group, dict):
-        return "غير متاح"
-
-    direction = safe_value(
-        group.get("direction", group.get("bias"))
-    )
-
-    agreement = group.get("agreement")
-
-    result = f"الاتجاه الوصفي: {direction}"
-
-    if agreement is not None:
-        result += f"\nالتوافق: {safe_value(agreement)}"
-
-    available = group.get("available")
-    requested = group.get("requested")
-
-    if available is not None and requested is not None:
-        result += f"\nالفريمات المتاحة: {available}/{requested}"
-
-    return result
-
-
-# ==============================
-# BUILD MAIN REPORT
-# ==============================
-
-def build_report(symbol, analysis):
-    if not isinstance(analysis, dict):
-        return "تعذر تكوين التقرير."
-
-    summary = analysis.get("summary", {})
-
-    if not isinstance(summary, dict):
+def build_analysis_report(symbol,analysis):
+    summary = analysis.get("summary",{})
+    groups = analysis.get("groups",{})
+    if not isinstance(summary,dict):
         summary = {}
-
-    price = format_number(
-        summary.get("current_price_reference")
-    )
-
-    bias = safe_value(summary.get("bias"))
-    confidence = summary.get("confidence")
-
-    consensus = safe_value(
-        summary.get("consensus_state")
-    )
-
-    main_direction = safe_value(
-        summary.get("main_direction")
-    )
-
-    medium_direction = safe_value(
-        summary.get("medium_direction")
-    )
-
-    short_direction = safe_value(
-        summary.get("short_direction")
-    )
-
-    groups = summary.get("groups", {})
-
-    if not isinstance(groups, dict):
+    if not isinstance(groups,dict):
         groups = {}
 
-    report = [
-        "📊 <b>ICB | MARKET RESEARCH</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"الأداة: <b>{escape(symbol)}</b>",
-        f"السعر المرجعي: <b>{escape(price)}</b>",
-        "",
-        "🧠 <b>قراءة الهيكل العام</b>",
-        f"الميل الوصفي: {escape(bias)}",
-        f"حالة التوافق: {escape(consensus)}",
-        ""
-    ]
+    bias_names = {
+        "bullish":"إيجابي",
+        "bearish":"سلبي",
+        "neutral":"محايد"
+    }
 
-    if confidence is not None:
-        report.append(
-            f"قوة النموذج النسبية: {escape(safe_value(confidence))}"
-        )
-
-        report.append(
-            "<i>هذه درجة تقييم داخلية وليست احتمالاً لنجاح حركة مستقبلية.</i>"
-        )
-
-        report.append("")
-
-    report.extend([
-        "📌 <b>تحليل المجموعات الزمنية</b>",
-        "",
-        "🔵 <b>الرئيسي</b>",
-        escape(format_group(groups.get("الرئيسي", {}))),
-        f"الاتجاه: {escape(main_direction)}",
-        "",
-        "🟡 <b>المتوسط</b>",
-        escape(format_group(groups.get("المتوسط", {}))),
-        f"الاتجاه: {escape(medium_direction)}",
-        "",
-        "🟢 <b>القصير</b>",
-        escape(format_group(groups.get("القصير", {}))),
-        f"الاتجاه: {escape(short_direction)}",
-        "",
-        "━━━━━━━━━━━━━━━━━━",
-        "🧱 <b>مناطق الدعم</b>",
-        escape(format_levels(summary.get("support", []))),
-        "",
-        "🧱 <b>مناطق المقاومة</b>",
-        escape(format_levels(summary.get("resistance", []))),
-        "",
-        "━━━━━━━━━━━━━━━━━━",
-        "<i>التقرير للدراسة وفهم بنية السوق فقط، "
-        "ولا يمثل توصية شراء أو بيع.</i>",
-        "",
-        "<b>ICB | Institutional Code Breaker</b>"
-    ])
-
-    text = "\n".join(report)
-
-    if len(text) > MAX_REPORT_LENGTH:
-        text = (
-            text[:MAX_REPORT_LENGTH - 60]
-            + "\n\n<i>تم اختصار التقرير للحفاظ على طول الرسالة.</i>"
-        )
-
-    return text
-
-
-# ==============================
-# SEND AI INTERPRETATION
-# ==============================
-
-async def send_ai_report(bot, chat_id, symbol, analysis):
-    try:
-        ai_report = await asyncio.to_thread(
-            interpret_analysis,
-            symbol,
-            analysis
-        )
-
-        if not ai_report:
-            ai_report = "لم ينتج عقل ICB تفسيراً لهذه البيانات."
-
-        ai_report = str(ai_report).strip()
-
-        chunks = []
-
-        while ai_report:
-            if len(ai_report) <= MAX_AI_CHUNK_LENGTH:
-                chunks.append(ai_report)
-                break
-
-            split_at = ai_report.rfind(
-                "\n",
-                0,
-                MAX_AI_CHUNK_LENGTH
-            )
-
-            if split_at < MAX_AI_CHUNK_LENGTH // 2:
-                split_at = ai_report.rfind(
-                    " ",
-                    0,
-                    MAX_AI_CHUNK_LENGTH
-                )
-
-            if split_at < MAX_AI_CHUNK_LENGTH // 2:
-                split_at = MAX_AI_CHUNK_LENGTH
-
-            chunks.append(ai_report[:split_at].strip())
-            ai_report = ai_report[split_at:].strip()
-
-        for index, chunk in enumerate(chunks):
-            heading = (
-                "🧠 <b>ICB AI INTERPRETATION</b>\n"
-                f"الأداة: <b>{escape(symbol)}</b>\n"
-            )
-
-            if len(chunks) > 1:
-                heading += f"الجزء {index + 1}/{len(chunks)}\n"
-
-            heading += "\n"
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=heading + escape(chunk),
-                parse_mode="HTML"
-            )
-
-    except Exception:
-        logger.exception(
-            "AI report delivery failed for %s",
-            symbol
-        )
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ تعذر إرسال تفسير Groq للأداة {symbol}.\n"
-                "التقرير الحسابي الأساسي ما زال متاحاً."
-            )
-        )
-
-
-# ==============================
-# MARKET ANALYSIS ENGINE
-# ==============================
-
-async def run_analysis(symbol):
-    logger.info("Starting analysis for %s", symbol)
-
-    bundle = await asyncio.to_thread(
-        fetch_market_bundle,
-        symbol
+    bias = bias_names.get(
+        summary.get("bias","neutral"),
+        "غير محدد"
     )
 
-    if not bundle:
-        raise ValueError("مصدر البيانات لم يرجع بيانات.")
+    lines = [
+        "📊 <b>ICB | التقرير البحثي</b>",
+        "",
+        f"الأداة: <b>{escape_html(symbol)}</b>",
+        f"الحالة العامة: <b>{bias}</b>",
+        f"الدرجة الحسابية: <b>{safe_number(summary.get('score'),4)}</b>",
+        f"درجة التوافق: <b>{safe_number(summary.get('confidence'),4)}</b>",
+        f"تغطية البيانات: <b>{safe_number(summary.get('coverage'),2)}</b>",
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "🧭 <b>توافق الأطر الزمنية</b>"
+    ]
+
+    for name,label in [
+        ("main","الأطر الكبيرة"),
+        ("medium","الأطر المتوسطة"),
+        ("short","الأطر الصغيرة")
+    ]:
+        group = groups.get(name,{})
+        group_bias = bias_names.get(
+            group.get("bias","neutral"),
+            "غير محدد"
+        )
+        lines.append(
+            f"{label}: <b>{group_bias}</b> "
+            f"| الدرجة: {safe_number(group.get('score'),3)} "
+            f"| التغطية: {safe_number(group.get('coverage'),2)}"
+        )
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "🟢 <b>مناطق الدعم التاريخية</b>",
+        _format_levels(summary.get("support")),
+        "",
+        "🔴 <b>مناطق المقاومة التاريخية</b>",
+        _format_levels(summary.get("resistance")),
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "📚 <b>ملخص الأدلة الحسابية</b>"
+    ])
+
+    evidence = summary.get("evidence",[])
+    if isinstance(evidence,list) and evidence:
+        lines.extend(
+            "• " + escape_html(item)
+            for item in evidence[:8]
+        )
+    else:
+        lines.append("لا توجد أدلة كافية.")
+
+    warnings = summary.get("warnings",[])
+    lines.extend([
+        "",
+        "⚠️ <b>تنبيهات جودة البيانات</b>"
+    ])
+
+    if isinstance(warnings,list) and warnings:
+        lines.extend(
+            "• " + escape_html(item)
+            for item in warnings[:8]
+        )
+    else:
+        lines.append("لا توجد تنبيهات مسجلة.")
+
+    lines.extend([
+        "",
+        "<i>هذا تقرير بحثي وتعليمي. "
+        "الدرجات الحسابية ليست احتمالات نجاح ولا توصيات تداول.</i>"
+    ])
+
+    report = "\n".join(lines)
+    if len(report) > MAX_REPORT_LENGTH:
+        report = report[:MAX_REPORT_LENGTH-40] + "\n\n<i>تم اختصار التقرير.</i>"
+    return report
+
+async def run_analysis(symbol):
+    normalized = resolve_symbol(symbol)
+    if not normalized:
+        raise ValueError("الرمز غير موجود في قائمة الأدوات المدعومة.")
+
+    started = time.monotonic()
+
+    bundle = await asyncio.wait_for(
+        asyncio.to_thread(
+            fetch_market_bundle,
+            normalized,
+            TIMEFRAMES
+        ),
+        timeout=REQUEST_TIMEOUT
+    )
+
+    if not isinstance(bundle,dict):
+        raise RuntimeError("مزود البيانات أعاد نتيجة غير صحيحة.")
 
     analysis = await asyncio.to_thread(
         analyze_multitimeframe,
         bundle
     )
 
-    if not analysis:
-        raise ValueError("تعذر تحليل البيانات.")
+    if not isinstance(analysis,dict) or not analysis.get("summary"):
+        raise RuntimeError("محرك التحليل لم ينتج تقريرًا صالحًا.")
 
-    return bundle, analysis
+    elapsed = round(time.monotonic()-started,2)
 
+    return {
+        "symbol":normalized,
+        "bundle":bundle,
+        "analysis":analysis,
+        "elapsed_seconds":elapsed
+    }
 
-# ==============================
-# SEND ANALYSIS
-# ==============================
-
-async def send_analysis(update, context, user_symbol):
-    message = update.effective_message
-
-    resolved = resolve_symbol(user_symbol)
-
-    if not resolved:
+async def send_ai_report(message,analysis):
+    try:
+        ai_text = await asyncio.to_thread(
+            interpret_analysis,
+            analysis
+        )
+        chunks = split_text(
+            ai_text,
+            MAX_AI_CHUNK_LENGTH
+        )
+        for chunk in chunks:
+            await message.reply_text(
+                chunk,
+                disable_web_page_preview=True
+            )
+    except Exception:
+        logger.exception("AI report delivery failed")
         await message.reply_text(
-            "الرمز غير موجود في ملفات الرموز الحالية.\n\n"
-            "راجع symbols/forex.json أو symbols/crypto.json."
+            "تعذر إرسال التفسير النصي حاليًا، "
+            "لكن التقرير الحسابي ما زال متاحًا."
+        )
+
+async def send_chart(message,symbol,bundle,analysis):
+    try:
+        chart = await asyncio.to_thread(
+            generate_timeframe_chart,
+            symbol,
+            bundle,
+            analysis
+        )
+        if chart is None:
+            await message.reply_text(
+                "تعذر إنشاء الرسم البياني لعدم توفر بيانات مناسبة."
+            )
+            return
+        await message.reply_photo(
+            photo=chart,
+            caption=f"ICB | {symbol} | الرسم البحثي"
+        )
+    except Exception:
+        logger.exception("Chart delivery failed")
+        await message.reply_text(
+            "تعذر إنشاء الرسم البياني حاليًا."
+        )
+
+async def send_analysis(update,symbol):
+    message = update.effective_message
+    if message is None:
+        return
+
+    normalized = resolve_symbol(symbol)
+    if not normalized:
+        await message.reply_text(
+            "الرمز غير مدعوم أو غير موجود في قائمة الأدوات."
         )
         return
 
-    await context.bot.send_chat_action(
-        chat_id=message.chat_id,
-        action=ChatAction.TYPING
-    )
+    chat_id = update.effective_chat.id
+    request_key = (chat_id,normalized)
 
-    status_message = await message.reply_text(
-        f"⏳ جاري جمع بيانات {user_symbol} وتحليل الأطر الزمنية..."
-    )
+    async with ACTIVE_REQUESTS_LOCK:
+        if request_key in ACTIVE_REQUESTS:
+            await message.reply_text(
+                "يوجد تحليل جارٍ لنفس الأداة. انتظر حتى ينتهي."
+            )
+            return
+        ACTIVE_REQUESTS.add(request_key)
+
+    status_message = None
 
     try:
-        bundle, analysis = await run_analysis(resolved)
+        status_message = await message.reply_text(
+            f"⏳ جارٍ جمع البيانات وتحليل {escape_html(normalized)}..."
+        )
 
-        report = build_report(
-            user_symbol,
-            analysis
+        await message.chat.send_action(
+            ChatAction.TYPING
+        )
+
+        result = await run_analysis(normalized)
+
+        report = build_analysis_report(
+            normalized,
+            result["analysis"]
         )
 
         await status_message.edit_text(
@@ -526,386 +388,338 @@ async def send_analysis(update, context, user_symbol):
         )
 
         await send_ai_report(
-            context.bot,
-            message.chat_id,
-            user_symbol,
-            analysis
+            message,
+            result["analysis"]
         )
 
-        try:
-            chart = await asyncio.to_thread(
-                generate_timeframe_chart,
-                bundle,
-                analysis,
-                user_symbol
+        await send_chart(
+            message,
+            normalized,
+            result["bundle"],
+            result["analysis"]
+        )
+
+        logger.info(
+            "Analysis completed for %s in %s seconds",
+            normalized,
+            result["elapsed_seconds"]
+        )
+
+    except asyncio.TimeoutError:
+        if status_message:
+            await status_message.edit_text(
+                "انتهت مهلة جلب البيانات. حاول مرة أخرى لاحقًا."
             )
-
-            if chart:
-                if hasattr(chart, "seek"):
-                    chart.seek(0)
-
-                await message.reply_photo(
-                    photo=chart,
-                    caption=f"ICB | {user_symbol} | Market Structure"
-                )
-
-        except Exception:
-            logger.exception("Chart generation failed")
-
     except Exception as error:
-        logger.exception(
-            "Analysis failed for %s",
-            user_symbol
-        )
-
-        await status_message.edit_text(
-            "❌ تعذر إكمال التحليل.\n\n"
-            f"التفاصيل: {escape(str(error)[:700])}\n\n"
-            "راجع سجلات Railway لمعرفة مصدر المشكلة.",
-            parse_mode="HTML"
-        )
-
-# ==============================
-# START COMMAND
-# ==============================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not await check_access(update, context):
-        return
-
-    await update.effective_message.reply_text(
-        "🌋 <b>مرحباً بك في ICB</b>\n\n"
-        "منصة بحث متعددة الأطر الزمنية.\n\n"
-        "الأوامر المتاحة:\n"
-        "/analyze GOLD - تحليل الذهب\n"
-        "/analyze BTCUSDT - تحليل البيتكوين\n"
-        "/symbols - عرض الرموز المتاحة\n"
-        "/daily - تفعيل التقرير اليومي\n"
-        "/help - المساعدة\n\n"
-        "أو أرسل الرمز مباشرة في رسالة.",
-        parse_mode="HTML"
-    )
-
-
-# ==============================
-# HELP COMMAND
-# ==============================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not await check_access(update, context):
-        return
-
-    await update.effective_message.reply_text(
-        "📘 <b>طريقة استخدام ICB</b>\n\n"
-        "1. أرسل /analyze ثم اسم الأداة.\n"
-        "2. انتظر جمع البيانات من المصادر.\n"
-        "3. سيظهر التقرير متعدد الأطر الزمنية.\n"
-        "4. سيظهر تفسير Groq بعد التقرير الحسابي.\n"
-        "5. قد يظهر الرسم البياني إذا توفرت بياناته.\n\n"
-        "أمثلة:\n"
-        "<code>/analyze GOLD</code>\n"
-        "<code>/analyze BTCUSDT</code>\n\n"
-        "للتقرير اليومي أرسل /daily.\n\n"
-        "التقارير مخصصة للبحث ودراسة حركة السوق.",
-        parse_mode="HTML"
-    )
-
-
-# ==============================
-# SYMBOLS COMMAND
-# ==============================
-
-async def symbols_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not await check_access(update, context):
-        return
-
-    refresh_symbols()
-
-    forex_names = sorted(SYMBOL_ALIASES.keys())
-    crypto_names = sorted(CRYPTO_SYMBOLS)
-
-    lines = [
-        "📚 <b>رموز ICB المتاحة</b>",
-        "",
-        "🟡 <b>العملات والسلع والمؤشرات</b>"
-    ]
-
-    lines.extend(
-        f"• {escape(item)}"
-        for item in forex_names[:60]
-    )
-
-    lines.extend([
-        "",
-        "₿ <b>العملات الرقمية</b>"
-    ])
-
-    lines.extend(
-        f"• {escape(item)}"
-        for item in crypto_names[:60]
-    )
-
-    if not forex_names and not crypto_names:
-        lines.append(
-            "لم يتم العثور على رموز في ملفات JSON."
-        )
-
-    await update.effective_message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML"
-    )
-
-
-# ==============================
-# ANALYZE COMMAND
-# ==============================
-
-async def analyze_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not await check_access(update, context):
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "اكتب الرمز بعد الأمر.\n\n"
-            "مثال:\n"
-            "/analyze GOLD"
-        )
-        return
-
-    symbol = context.args[0]
-
-    await send_analysis(
-        update,
-        context,
-        symbol
-    )
-
-
-# ==============================
-# DIRECT SYMBOL MESSAGE
-# ==============================
-
-async def text_message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not await check_access(update, context):
-        return
-
-    text_value = update.effective_message.text.strip()
-
-    if not text_value or len(text_value.split()) != 1:
-        return
-
-    if text_value.startswith("/"):
-        return
-
-    refresh_symbols()
-
-    if resolve_symbol(text_value):
-        await send_analysis(
-            update,
-            context,
-            text_value
-        )
-
-
-# ==============================
-# DAILY REPORT
-# ==============================
-
-async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Starting ICB daily report")
-
-    chat_id = context.job.chat_id
-
-    for symbol in DAILY_SYMBOLS:
-        try:
-            resolved = resolve_symbol(symbol)
-
-            if not resolved:
-                logger.warning(
-                    "Daily symbol not configured: %s",
-                    symbol
-                )
-                continue
-
-            bundle, analysis = await run_analysis(resolved)
-
-            report = build_report(
-                symbol,
-                analysis
-            )
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=report,
+        logger.exception("Analysis failed for %s",normalized)
+        if status_message:
+            await status_message.edit_text(
+                "تعذر إكمال التحليل: "
+                + escape_html(str(error))[:800],
                 parse_mode="HTML"
             )
+        else:
+            await message.reply_text(
+                "حدث خطأ أثناء التحليل."
+            )
+    finally:
+        async with ACTIVE_REQUESTS_LOCK:
+            ACTIVE_REQUESTS.discard(request_key)
 
-            await send_ai_report(
-                context.bot,
-                chat_id,
+async def start_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "مرحبًا بك في ICB Research Engine\n\n"
+        "منظومة بحثية لتحليل الأسواق والأطر الزمنية.\n\n"
+        "الأوامر المتاحة:\n"
+        "/analyze BTCUSDT - تحليل أداة\n"
+        "/symbols - الأدوات المدعومة\n"
+        "/daily - تفعيل التقرير اليومي\n"
+        "/stopdaily - إيقاف التقرير اليومي\n"
+        "/status - حالة المحركات\n"
+        "/help - المساعدة\n\n"
+        "يمكنك أيضًا إرسال رمز الأداة مباشرة."
+    )
+
+async def help_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "📘 ICB Research Engine\n\n"
+        "أرسل:\n"
+        "/analyze GOLD\n"
+        "/analyze BTCUSDT\n\n"
+        "أو أرسل الرمز مباشرة.\n\n"
+        "الأوامر:\n"
+        "/start\n"
+        "/help\n"
+        "/symbols\n"
+        "/status\n"
+        "/daily\n"
+        "/stopdaily\n\n"
+        "المنظومة تقدم تحليلًا بحثيًا وتعليميًا، "
+        "ولا تصدر توصيات تنفيذية."
+    )
+
+async def symbols_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    refresh_symbols()
+    symbols = sorted(SUPPORTED_SYMBOLS)
+    if not symbols:
+        await message.reply_text(
+            "قائمة الأدوات غير متاحة. راجع ملفات symbols."
+        )
+        return
+    forex = []
+    crypto = []
+    for symbol in symbols:
+        if symbol.endswith("USDT"):
+            crypto.append(symbol)
+        else:
+            forex.append(symbol)
+    lines = [
+        "📚 ICB | الأدوات المدعومة",
+        "",
+        "العملات الرقمية:"
+    ]
+    lines.extend(crypto[:100] or ["لا توجد أدوات رقمية مسجلة."])
+    lines.extend([
+        "",
+        "الفوركس والأسواق الأخرى:"
+    ])
+    lines.extend(forex[:100] or ["لا توجد أدوات أخرى مسجلة."])
+    text = "\n".join(lines)
+    for chunk in split_text(text,3500):
+        await message.reply_text(chunk)
+
+async def analyze_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    if not context.args:
+        await message.reply_text(
+            "اكتب الرمز بعد الأمر.\nمثال:\n/analyze BTCUSDT"
+        )
+        return
+    await send_analysis(update,context.args[0])
+
+async def text_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+    symbol = message.text.strip().split()[0]
+    if symbol.startswith("/"):
+        return
+    if resolve_symbol(symbol):
+        await send_analysis(update,symbol)
+        return
+    await message.reply_text(
+        "لم أتعرف على الرمز.\n"
+        "استخدم /symbols لعرض الأدوات المدعومة."
+    )
+
+async def daily_report(
+    context:ContextTypes.DEFAULT_TYPE
+):
+    job = context.job
+    if job is None or not job.chat_id:
+        return
+    chat_id = job.chat_id
+    for symbol in DAILY_SYMBOLS:
+        try:
+            result = await run_analysis(symbol)
+            report = build_analysis_report(
                 symbol,
-                analysis
+                result["analysis"]
             )
-
-            chart = await asyncio.to_thread(
-                generate_timeframe_chart,
-                bundle,
-                analysis,
-                symbol
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📅 التقرير البحثي اليومي\n\n"+report,
+                parse_mode="HTML"
             )
-
-            if chart:
-                if hasattr(chart, "seek"):
-                    chart.seek(0)
-
-                await context.bot.send_photo(
+            await context.bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING
+            )
+            ai_text = await asyncio.to_thread(
+                interpret_analysis,
+                result["analysis"]
+            )
+            for chunk in split_text(ai_text,MAX_AI_CHUNK_LENGTH):
+                await context.bot.send_message(
                     chat_id=chat_id,
-                    photo=chart,
-                    caption=f"ICB Daily Research | {symbol}"
+                    text=chunk
                 )
-
         except Exception:
             logger.exception(
                 "Daily report failed for %s",
                 symbol
             )
-
-
-# ==============================
-# SET DAILY REPORT
-# ==============================
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"تعذر إعداد التقرير البحثي للأداة {symbol}."
+                )
+            except Exception:
+                logger.exception("Daily error notification failed")
 
 async def set_daily_report_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update:Update,
+    context:ContextTypes.DEFAULT_TYPE
 ):
-    if not await check_access(update, context):
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
         return
-
-    chat_id = update.effective_chat.id
-
     if context.job_queue is None:
-        await update.effective_message.reply_text(
-            "ميزة التقارير المجدولة غير مفعلة. "
+        await message.reply_text(
+            "خدمة الجدولة غير متاحة. "
             "تأكد من تثبيت python-telegram-bot[job-queue]."
         )
         return
-
-    existing = context.job_queue.get_jobs_by_name(
-        f"daily_{chat_id}"
-    )
-
-    for job in existing:
-        job.schedule_removal()
-
+    job_name = f"daily_{chat.id}"
+    existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for existing_job in existing_jobs:
+        existing_job.schedule_removal()
     context.job_queue.run_daily(
         daily_report,
         time=DAILY_REPORT_TIME,
-        chat_id=chat_id,
-        name=f"daily_{chat_id}",
-        timezone=CAIRO_TZ
+        chat_id=chat.id,
+        name=job_name
+    )
+    await message.reply_text(
+        "تم تفعيل التقرير البحثي اليومي.\n"
+        "موعد التقرير: الساعة 03:00 صباحًا بتوقيت القاهرة.\n"
+        "الأدوات: "+", ".join(DAILY_SYMBOLS)
     )
 
-    await update.effective_message.reply_text(
-        "✅ تم تفعيل التقرير اليومي في هذه المحادثة.\n"
-        "موعد الإرسال: 03:00 صباحاً بتوقيت القاهرة.\n"
-        "الأدوات: الذهب والبيتكوين.\n"
-        "سيتم إرسال التحليل الحسابي وتفسير Groq والرسم البياني."
+async def stop_daily_command(
+    update:Update,
+    context:ContextTypes.DEFAULT_TYPE
+):
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if context.job_queue is None:
+        await message.reply_text(
+            "خدمة الجدولة غير متاحة."
+        )
+        return
+    job_name = f"daily_{chat.id}"
+    jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in jobs:
+        job.schedule_removal()
+    await message.reply_text(
+        "تم إيقاف التقرير اليومي."
+        if jobs
+        else "لا يوجد تقرير يومي مفعل."
     )
 
+async def status_command(
+    update:Update,
+    context:ContextTypes.DEFAULT_TYPE
+):
+    message = update.effective_message
+    if message is None:
+        return
+    ai_status = get_ai_status()
+    symbols_count = len(SUPPORTED_SYMBOLS)
+    job_queue_status = (
+        "متاحة"
+        if context.job_queue is not None
+        else "غير متاحة"
+    )
+    lines = [
+        "🧠 ICB | حالة النظام",
+        "",
+        "محرك البيانات: متصل برمجيًا",
+        "محرك التحليل: جاهز",
+        "محرك الرسوم: جاهز",
+        f"محرك الذكاء الاصطناعي: {'مهيأ' if ai_status['configured'] else 'مفتاح API غير موجود'}",
+        f"نموذج التفسير: {ai_status['model']}",
+        f"عدد الأدوات المسجلة: {symbols_count}",
+        f"خدمة الجدولة: {job_queue_status}",
+        "",
+        "ملاحظة: الجاهزية البرمجية لا تعني أن جميع مزودي البيانات متاحون لحظيًا."
+    ]
+    await message.reply_text("\n".join(lines))
 
-# ==============================
-# ERROR HANDLER
-# ==============================
-
-async def error_handler(update, context):
+async def error_handler(
+    update:object,
+    context:ContextTypes.DEFAULT_TYPE
+):
+    error = context.error
     logger.error(
-        "Telegram application error",
-        exc_info=(
-            type(context.error),
-            context.error,
-            context.error.__traceback__
-        ) if context.error else None
+        "Telegram application error: %s",
+        type(error).__name__ if error else "Unknown"
     )
+    if isinstance(update,Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "حدث خطأ غير متوقع. حاول مرة أخرى."
+            )
+        except Exception:
+            logger.exception("Could not send error notification")
 
+async def post_init(application:Application):
+    logger.info("ICB application initialized")
+    logger.info("Loaded symbols: %s",len(SUPPORTED_SYMBOLS))
+    logger.info("Daily symbols: %s",DAILY_SYMBOLS)
 
-# ==============================
-# APPLICATION STARTUP
-# ==============================
+async def post_shutdown(application:Application):
+    logger.info("ICB application shutting down")
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing from Railway Variables."
+            "TELEGRAM_BOT_TOKEN environment variable is missing"
         )
-
-    logger.info("Loading ICB symbol configuration")
-
-    refresh_symbols()
-
-    logger.info(
-        "Loaded %s aliases and %s crypto symbols",
-        len(SYMBOL_ALIASES),
-        len(CRYPTO_SYMBOLS)
-    )
-
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
-
     application.add_handler(
-        CommandHandler("start", start_command)
+        CommandHandler("start",start_command)
     )
-
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler("help",help_command)
     )
-
     application.add_handler(
-        CommandHandler("symbols", symbols_command)
+        CommandHandler("symbols",symbols_command)
     )
-
     application.add_handler(
-        CommandHandler("analyze", analyze_command)
+        CommandHandler("analyze",analyze_command)
     )
-
     application.add_handler(
-        CommandHandler("daily", set_daily_report_command)
+        CommandHandler("daily",set_daily_report_command)
     )
-
+    application.add_handler(
+        CommandHandler("stopdaily",stop_daily_command)
+    )
+    application.add_handler(
+        CommandHandler("status",status_command)
+    )
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_message_handler
+            text_handler
         )
     )
-
     application.add_error_handler(error_handler)
-
-    logger.info("ICB BOT IS STARTING")
-
+    logger.info("Starting ICB Telegram Research Engine")
     application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
-
 
 if __name__ == "__main__":
     main()
