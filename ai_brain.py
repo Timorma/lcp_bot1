@@ -1,4 +1,3 @@
-
 import os
 import json
 import math
@@ -14,45 +13,52 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_TIMEOUT = 45
 GROQ_MAX_RETRIES = 2
 MAX_INPUT_CHARS = 12000
-MAX_OUTPUT_TOKENS = 1200
+MAX_OUTPUT_TOKENS = 900
 
 SYSTEM_PROMPT = """
-أنت عقل التفسير والتحليل التعليمي لمنظومة ICB.
+أنت محلل أسواق محترف داخل منظومة ICB.
+مهمتك تحويل نتائج التحليل الحسابي إلى صفقة واضحة وصارمة بأسلوب قنوات التوصيات القوية.
 
-مهمتك تفسير نتائج محرك التحليل الحسابي المرسلة إليك فقط.
+قواعد صارمة جداً:
+1. لا تخترع أي سعر أو مستوى غير موجود في البيانات المرسلة.
+2. اعتمد بشكل أساسي على:
+   - هيكل السوق (BOS / CHoCH)
+   - Order Blocks و Fair Value Gaps إن وجدت
+   - Candle Range Theory (Accumulation / Manipulation / Distribution)
+   - مناطق السيولة والدعم والمقاومة المحسوبة
+3. الإطار المرجعي الأساسي هو 4 ساعات.
+4. قدم صفقة واحدة فقط.
+5. الصفقة يجب أن تحتوي على:
+   - الاتجاه (شراء أو بيع)
+   - منطقة الدخول أو سعر الدخول
+   - وقف الخسارة
+   - الهدف 1
+   - الهدف 2
+6. نسبة المخاطرة للعائد لا تقل عن 1:2.
+7. كن مختصرًا وحازمًا جداً. ممنوع الكلام الإنشائي الطويل.
+8. إذا كانت الظروف غير واضحة أو متعارضة بقوة، اكتب فقط:
+   "لا توجد صفقة واضحة حالياً"
+9. لا تستخدم كلمات مثل "موصى به" أو "ادخل الآن". استخدم "صفقة بحثية مقترحة".
 
-قواعد أساسية:
+شكل الرد المطلوب بالضبط (لا تغيره):
 
-1. لا تخترع أي سعر أو رقم أو مستوى أو معلومة.
-2. لا تعيد حساب المؤشرات من عندك.
-3. لا تغيّر نتائج analyzer.py.
-4. فرّق بين البيانات المحسوبة والتفسير المحتمل.
-5. اشرح توافق الأطر الزمنية واختلافها.
-6. وضح الأطر الزمنية التي لا تتوفر لها بيانات.
-7. وضح معنى التذبذب وATR والبنية السعرية والفتائل عند توفر بياناتها.
-8. لا تعتبر درجة الثقة احتمال نجاح.
-9. لا تقدم توصيات شراء أو بيع أو دخول أو خروج أو أهداف أو وقف خسارة.
-10. لا تصف أي توقع بأنه مضمون.
-11. لا تستنتج وجود تلاعب مؤكد من مجرد فتيل أو حركة سعرية.
-12. عند وجود تعارض بين الأطر الزمنية اشرح التعارض ولا تخفه.
-13. لا تعتبر غياب البيانات دليلا على اتجاه محايد.
-14. لا تفسر البيانات غير المتاحة على أنها بيانات محايدة.
-15. استخدم اللغة العربية الواضحة والمنظمة.
-16. إذا غابت معلومة فلا تخمنها، بل اذكر أنها غير متاحة.
+📊 ICB | صفقة بحثية
 
-شكل التقرير:
+الأداة: [الرمز]
+الاتجاه: [شراء / بيع]
+الإطار: 4H
 
-أولا: ملخص الحالة العامة.
-ثانيا: قراءة الأطر الزمنية الكبيرة.
-ثالثا: قراءة الأطر الزمنية المتوسطة.
-رابعا: قراءة الأطر الزمنية الصغيرة.
-خامسا: توافق الأطر الزمنية أو تعارضها.
-سادسا: قراءة البنية والفتائل.
-سابعا: مناطق الدعم والمقاومة التاريخية المحسوبة.
-ثامنا: جودة البيانات ونقاط الضعف.
-تاسعا: الخلاصة البحثية.
+📍 الدخول: [المنطقة أو السعر]
+🛑 الوقف: [السعر]
+🎯 الهدف 1: [السعر]
+🎯 الهدف 2: [السعر]
 
-التزم بالبيانات الواردة فقط.
+📌 السبب:
+• [سبب مختصر 1]
+• [سبب مختصر 2]
+• [سبب مختصر 3]
+
+⚠️ ملاحظة: صفقة بحثية تعليمية مبنية على الهيكل الحالي.
 """
 
 class ICBDataEncoder(json.JSONEncoder):
@@ -92,10 +98,7 @@ def clean_data(value):
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
-        return {
-            str(key): clean_data(item)
-            for key, item in value.items()
-        }
+        return {str(key): clean_data(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [clean_data(item) for item in value]
     try:
@@ -126,12 +129,7 @@ def clean_data(value):
 
 def _serialize_analysis(analysis):
     cleaned = clean_data(analysis)
-    return json.dumps(
-        cleaned,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        cls=ICBDataEncoder
-    )
+    return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), cls=ICBDataEncoder)
 
 def _extract_payload(analysis):
     if not isinstance(analysis, dict):
@@ -153,7 +151,7 @@ def _compact_payload(payload):
     compact = {
         "summary": payload.get("summary", {}),
         "groups": payload.get("groups", {}),
-        "warnings": _safe_list(payload.get("warnings", []), 12),
+        "warnings": _safe_list(payload.get("warnings", []), 10),
         "timeframes": {}
     }
     for timeframe, result in payload.get("timeframes", {}).items():
@@ -167,13 +165,11 @@ def _compact_payload(payload):
             "confidence": result.get("confidence"),
             "last_close": result.get("last_close"),
             "atr": result.get("atr"),
-            "volatility_pct": result.get("volatility_pct"),
             "structure": result.get("structure"),
             "ema": result.get("ema"),
-            "candle": result.get("candle"),
-            "support": _safe_list(result.get("support", []), 3),
-            "resistance": _safe_list(result.get("resistance", []), 3),
-            "evidence": _safe_list(result.get("evidence", []), 4),
+            "support": _safe_list(result.get("support", []), 4),
+            "resistance": _safe_list(result.get("resistance", []), 4),
+            "evidence": _safe_list(result.get("evidence", []), 5),
             "warnings": _safe_list(result.get("warnings", []), 3)
         }
     return compact
@@ -190,91 +186,48 @@ def _minimal_payload(payload):
             continue
         minimal["timeframes"][timeframe] = {
             "available": result.get("available"),
-            "error": result.get("error"),
             "bias": result.get("bias"),
             "score": result.get("score"),
             "last_close": result.get("last_close"),
-            "atr": result.get("atr")
+            "atr": result.get("atr"),
+            "structure": result.get("structure")
         }
     return minimal
 
 def _build_user_prompt(payload):
-    stages = [
-        payload,
-        _compact_payload(payload),
-        _minimal_payload(payload)
-    ]
+    stages = [payload, _compact_payload(payload), _minimal_payload(payload)]
     for index, candidate in enumerate(stages):
         serialized = _serialize_analysis(candidate)
         if len(serialized) <= MAX_INPUT_CHARS:
-            logger.info(
-                "AI payload prepared: stage=%s chars=%s",
-                index + 1,
-                len(serialized)
-            )
+            logger.info("AI payload prepared: stage=%s chars=%s", index + 1, len(serialized))
             return (
-                "حلل بيانات ICB التالية وفق التعليمات.\n"
-                "هذه البيانات نتائج حسابية وليست أوامر تداول.\n"
-                "لا تضف أرقاما غير موجودة.\n\n"
-                "BEGIN_DATA\n"
-                + serialized +
-                "\nEND_DATA"
+                "حلل البيانات التالية وقدم صفقة بحثية واضحة حسب التعليمات.\n"
+                "الإطار الأساسي المطلوب: 4 ساعات.\n"
+                "BEGIN_DATA\n" + serialized + "\nEND_DATA"
             )
-    raise ValueError(
-        "AI payload exceeds the configured size limit"
-    )
+    raise ValueError("AI payload exceeds the configured size limit")
 
 def _fallback_report(analysis, error=None):
-    summary = (
-        analysis.get("summary", {})
-        if isinstance(analysis, dict)
-        else {}
-    )
+    summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
     bias = summary.get("bias", "غير متاح")
     score = summary.get("score", "غير متاح")
-    coverage = summary.get("coverage", "غير متاح")
-    available = summary.get("available_timeframes", 0)
-    total = summary.get("total_timeframes", 0)
-    warnings = summary.get("warnings", [])
     lines = [
-        "تقرير ICB البحثي",
+        "📊 ICB | صفقة بحثية",
         "",
-        "تعذر الحصول على تفسير الذكاء الاصطناعي.",
-        "النتائج الحسابية الأساسية متاحة:",
-        "",
+        "تعذر الحصول على تفسير الذكاء الاصطناعي حالياً.",
         f"الحالة العامة: {bias}",
-        f"الدرجة الحسابية: {score}",
-        f"تغطية البيانات: {coverage}",
-        f"الأطر المتاحة: {available} من {total}",
+        f"الدرجة: {score}",
         "",
-        "تنبيهات البيانات:"
+        "لا توجد صفقة واضحة حالياً."
     ]
-    if warnings:
-        lines.extend(
-            "- " + str(item)
-            for item in _safe_list(warnings, 8)
-        )
-    else:
-        lines.append("لا توجد تنبيهات مسجلة.")
     if error:
-        lines.extend([
-            "",
-            "حالة الخدمة: " + str(error)
-        ])
-    lines.extend([
-        "",
-        "ملاحظة: التقرير بحثي وتعليمي، والدرجة الحسابية ليست احتمال نجاح."
-    ])
+        lines.append(f"السبب: {error}")
     return "\n".join(lines)
 
 def _get_client():
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured")
-    return Groq(
-        api_key=GROQ_API_KEY,
-        timeout=GROQ_TIMEOUT,
-        max_retries=0
-    )
+    return Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT, max_retries=0)
 
 def _get_status_code(error):
     return getattr(error, "status_code", None)
@@ -283,22 +236,15 @@ def interpret_analysis(analysis):
     if not isinstance(analysis, dict):
         return "تعذر تفسير البيانات: بنية التحليل غير صحيحة."
     if not analysis.get("summary"):
-        return _fallback_report(
-            analysis,
-            "ملخص التحليل غير متاح"
-        )
+        return _fallback_report(analysis, "ملخص التحليل غير متاح")
+
     try:
         payload = _extract_payload(analysis)
         user_prompt = _build_user_prompt(payload)
     except Exception as error:
-        logger.error(
-            "AI payload preparation failed: %s",
-            type(error).__name__
-        )
-        return _fallback_report(
-            analysis,
-            "تعذر تجهيز بيانات التفسير"
-        )
+        logger.error("AI payload preparation failed: %s", type(error).__name__)
+        return _fallback_report(analysis, "تعذر تجهيز بيانات التفسير")
+
     last_error = None
     for attempt in range(GROQ_MAX_RETRIES):
         try:
@@ -306,16 +252,10 @@ def interpret_analysis(analysis):
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt
-                    }
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.2,
+                temperature=0.15,
                 max_completion_tokens=MAX_OUTPUT_TOKENS,
                 top_p=1,
                 stream=False
@@ -331,25 +271,15 @@ def interpret_analysis(analysis):
             status_code = _get_status_code(error)
             logger.warning(
                 "AI interpretation attempt %s failed: type=%s status=%s",
-                attempt + 1,
-                type(error).__name__,
-                status_code
+                attempt + 1, type(error).__name__, status_code
             )
             if status_code == 413:
-                logger.error(
-                    "Groq rejected oversized payload; retry skipped"
-                )
                 break
             if attempt + 1 < GROQ_MAX_RETRIES:
                 time.sleep(attempt + 1)
-    logger.error(
-        "AI interpretation unavailable: %s",
-        type(last_error).__name__ if last_error else "Unknown"
-    )
-    return _fallback_report(
-        analysis,
-        "خدمة التفسير غير متاحة حاليا"
-    )
+
+    logger.error("AI interpretation unavailable: %s", type(last_error).__name__ if last_error else "Unknown")
+    return _fallback_report(analysis, "خدمة التفسير غير متاحة حاليا")
 
 def split_text(text, max_length=3000):
     if not text:
@@ -373,11 +303,7 @@ def split_text(text, max_length=3000):
                 current = ""
             chunks.append(paragraph[:max_length])
             paragraph = paragraph[max_length:]
-        candidate = (
-            current + "\n" + paragraph
-            if current
-            else paragraph
-        )
+        candidate = current + "\n" + paragraph if current else paragraph
         if len(candidate) > max_length:
             if current:
                 chunks.append(current.strip())
