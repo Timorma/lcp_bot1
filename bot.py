@@ -4,6 +4,7 @@ import html
 import logging
 import asyncio
 import time
+from users import can_analyze, increment_usage
 from pathlib import Path
 from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
