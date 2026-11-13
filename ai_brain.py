@@ -14,7 +14,7 @@ GROQ_TIMEOUT = 45
 GROQ_MAX_RETRIES = 2
 MAX_INPUT_CHARS = 12000
 MAX_OUTPUT_TOKENS = 900
-"""
+
 SYSTEM_PROMPT = """
 أنت محلل أسواق محترف داخل منظومة ICB.
 مهمتك تحويل نتائج التحليل الحسابي إلى صفقة واضحة وصارمة بأسلوب قنوات التوصيات القوية.
