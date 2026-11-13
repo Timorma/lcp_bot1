@@ -446,9 +446,8 @@ def main():
     application.add_handler(CommandHandler("symbols", symbols_command))
     application.add_handler(CommandHandler("analyze", analyze_command))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, text_handler))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[^/]"), text_handler))
     application.add_error_handler(error_handler)
-
     logger.info("Starting ICB Telegram Research Engine")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
