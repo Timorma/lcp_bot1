@@ -4,7 +4,6 @@ import html
 import logging
 import asyncio
 import time
-from users import can_analyze, increment_usage
 from pathlib import Path
 from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
@@ -30,6 +29,7 @@ from ai_brain import (
     get_ai_status
 )
 from chart_drawer import generate_timeframe_chart
+from users import can_analyze, increment_usage
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -39,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger("ICB")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
+CHANNEL_USERNAME = "@ICBVO"
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,19 +48,14 @@ SYMBOLS_DIR = BASE_DIR / "symbols"
 MAX_REPORT_LENGTH = 3500
 MAX_AI_CHUNK_LENGTH = 3000
 REQUEST_TIMEOUT = 120
-DAILY_REPORT_TIME = datetime_time(hour=3, minute=0, tzinfo=CAIRO_TZ)
-
-DAILY_SYMBOLS = [
-    item.strip().upper()
-    for item in os.getenv("DAILY_SYMBOLS", "GOLD,BTCUSDT").split(",")
-    if item.strip()
-]
 
 ACTIVE_REQUESTS = set()
 ACTIVE_REQUESTS_LOCK = asyncio.Lock()
 
+
 def escape_html(value):
     return html.escape(str(value or ""))
+
 
 def safe_number(value, digits=4):
     try:
@@ -70,6 +65,7 @@ def safe_number(value, digits=4):
         return f"{number:,.{digits}f}"
     except (TypeError, ValueError, OverflowError):
         return "N/A"
+
 
 def load_json_file(filename):
     path = SYMBOLS_DIR / filename
@@ -84,12 +80,15 @@ def load_json_file(filename):
         logger.exception("Failed to load symbol file: %s", filename)
         return {}
 
+
 def load_symbol_configuration():
     forex = load_json_file("forex.json")
     crypto = load_json_file("crypto.json")
     return {"forex": forex, "crypto": crypto}
 
+
 SYMBOL_CONFIG = load_symbol_configuration()
+
 
 def _collect_symbols(config):
     symbols = set()
@@ -108,10 +107,13 @@ def _collect_symbols(config):
         symbols.update(str(alias).strip().upper() for alias in forex_aliases.keys())
     return symbols
 
+
 SUPPORTED_SYMBOLS = _collect_symbols(SYMBOL_CONFIG)
+
 
 def normalize_symbol(symbol):
     return str(symbol or "").strip().upper().replace("/", "")
+
 
 def resolve_symbol(symbol):
     normalized = normalize_symbol(symbol)
@@ -128,12 +130,14 @@ def resolve_symbol(symbol):
         return normalized
     return None
 
+
 def refresh_symbols():
     global SYMBOL_CONFIG
     global SUPPORTED_SYMBOLS
     SYMBOL_CONFIG = load_symbol_configuration()
     SUPPORTED_SYMBOLS = _collect_symbols(SYMBOL_CONFIG)
     return len(SUPPORTED_SYMBOLS)
+
 
 def _format_levels(levels, limit=5):
     if not isinstance(levels, list) or not levels:
@@ -147,8 +151,8 @@ def _format_levels(levels, limit=5):
         lines.append(f"• {price} | القوة: {strength}")
     return "\n".join(lines) if lines else "غير متاحة"
 
+
 def build_analysis_report(symbol, analysis):
-    """تقرير مختصر يدعم الصفقة"""
     summary = analysis.get("summary", {})
     groups = analysis.get("groups", {})
     if not isinstance(summary, dict):
@@ -199,6 +203,16 @@ def build_analysis_report(symbol, analysis):
         report = report[:MAX_REPORT_LENGTH - 40] + "\n\n<i>تم اختصار التقرير.</i>"
     return report
 
+
+async def check_channel_subscription(user_id: int, bot) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception:
+        logger.exception("Failed to check channel subscription")
+        return False
+
+
 async def run_analysis(symbol):
     normalized = resolve_symbol(symbol)
     if not normalized:
@@ -228,6 +242,7 @@ async def run_analysis(symbol):
         "elapsed_seconds": elapsed
     }
 
+
 async def send_ai_report(message, analysis):
     try:
         ai_text = await asyncio.to_thread(interpret_analysis, analysis)
@@ -239,6 +254,7 @@ async def send_ai_report(message, analysis):
         await message.reply_text(
             "تعذر إرسال التفسير النصي حالياً، لكن التقرير الحسابي متاح."
         )
+
 
 async def send_chart(message, symbol, bundle, analysis):
     try:
@@ -259,9 +275,29 @@ async def send_chart(message, symbol, bundle, analysis):
         logger.exception("Chart delivery failed")
         await message.reply_text("تعذر إنشاء الرسم البياني حالياً.")
 
+
 async def send_analysis(update, symbol):
     message = update.effective_message
     if message is None:
+        return
+
+    user_id = update.effective_user.id
+    bot = update.get_bot()
+
+    # 1. فحص اشتراك القناة
+    is_subscribed = await check_channel_subscription(user_id, bot)
+    if not is_subscribed:
+        await message.reply_text(
+            "يجب الاشتراك في القناة أولاً عشان تقدر تستخدم البوت:\n\n"
+            "👉 https://t.me/ICBVO\n\n"
+            "بعد الاشتراك ارجع وابعت الرمز تاني."
+        )
+        return
+
+    # 2. فحص عدد التحليلات المجانية
+    allowed, msg = can_analyze(user_id)
+    if not allowed:
+        await message.reply_text(msg)
         return
 
     normalized = resolve_symbol(symbol)
@@ -288,6 +324,9 @@ async def send_analysis(update, symbol):
         await message.chat.send_action(ChatAction.TYPING)
 
         result = await run_analysis(normalized)
+
+        # زيادة العداد بعد نجاح التحليل
+        increment_usage(user_id)
 
         report = build_analysis_report(normalized, result["analysis"])
         await status_message.edit_text(report, parse_mode="HTML")
@@ -317,6 +356,7 @@ async def send_analysis(update, symbol):
         async with ACTIVE_REQUESTS_LOCK:
             ACTIVE_REQUESTS.discard(request_key)
 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -329,8 +369,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/symbols\n"
         "/status\n"
         "/help\n\n"
-        "يمكنك إرسال الرمز مباشرة."
+        "يمكنك إرسال الرمز مباشرة.\n\n"
+        "ملاحظة: يجب الاشتراك في القناة أولاً، ومتاح لك تحليلين مجانيين فقط."
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -348,6 +390,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/symbols\n"
         "/status"
     )
+
 
 async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -373,6 +416,7 @@ async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in split_text(text, 3500):
         await message.reply_text(chunk)
 
+
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -381,6 +425,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("اكتب الرمز بعد الأمر.\nمثال:\n/analyze BTCUSDT")
         return
     await send_analysis(update, context.args[0])
+
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -395,6 +440,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(
         "لم أتعرف على الرمز.\nاستخدم /symbols لعرض الأدوات المدعومة."
     )
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -414,6 +460,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await message.reply_text("\n".join(lines))
 
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     logger.error("Telegram application error: %s", type(error).__name__ if error else "Unknown")
@@ -423,12 +470,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Could not send error notification")
 
+
 async def post_init(application: Application):
     logger.info("ICB application initialized")
     logger.info("Loaded symbols: %s", len(SUPPORTED_SYMBOLS))
 
+
 async def post_shutdown(application: Application):
     logger.info("ICB application shutting down")
+
 
 def main():
     if not BOT_TOKEN:
@@ -449,11 +499,13 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[^/]"), text_handler))
     application.add_error_handler(error_handler)
+
     logger.info("Starting ICB Telegram Research Engine")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
+
 
 if __name__ == "__main__":
     main()
