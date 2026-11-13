@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 USERS_FILE = BASE_DIR / "users.json"
 
-FREE_LIMIT = 2  # عدد التحليلات المجانية
+FREE_LIMIT = 100  # عدد التحليلات المجانية
 
 def _load_users():
     if not USERS_FILE.exists():
